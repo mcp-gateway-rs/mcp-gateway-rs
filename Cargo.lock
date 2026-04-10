@@ -1713,6 +1713,21 @@ name = "mcp-gateway-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "mcp-gateway-rs-lib",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-gateway-rs-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "axum-jwt-auth",

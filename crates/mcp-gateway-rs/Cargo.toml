@@ -1,0 +1,23 @@
+[package]
+name = "mcp-gateway-rs"
+version.workspace=true
+edition.workspace = true
+rust-version.workspace =true
+license-file.workspace =true
+keywords.workspace =true
+
+
+[dependencies]
+mcp-gateway-rs-lib.workspace=true
+anyhow.workspace=true
+clap.workspace=true
+thiserror.workspace=true
+tracing.workspace=true
+tracing-appender.workspace=true
+tracing-opentelemetry.workspace=true
+tracing-subscriber.workspace=true
+tokio.workspace=true
+
+
+[lints]
+workspace=true
