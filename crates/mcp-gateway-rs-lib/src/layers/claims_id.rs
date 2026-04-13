@@ -90,16 +90,11 @@ use crate::common::{McpGatewayAppState, McpGatewayClaims};
 //     }
 // }
 
-pub async fn claims_layer(
-    State(state): State<McpGatewayAppState>,
-    request: http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub async fn claims_layer(State(state): State<McpGatewayAppState>, request: http::Request<axum::body::Body>, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
     let mut new_parts = parts.clone();
     let decoder = state.jwt_token_decoder;
-    let maybe_claims =
-        Claims::<McpGatewayClaims>::from_request_parts(&mut new_parts, &decoder).await;
+    let maybe_claims = Claims::<McpGatewayClaims>::from_request_parts(&mut new_parts, &decoder).await;
     if let Ok(claims) = maybe_claims {
         parts.extensions.insert(claims.claims);
         let request = Request::from_parts(parts, body);
@@ -110,7 +105,7 @@ pub async fn claims_layer(
         Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from(format!("Invalid authorization token {:?}", err)))
-            .unwrap()
+            .body(Body::from(format!("Invalid authorization token {err:?}")))
+            .expect("Expecting this to work")
     }
 }

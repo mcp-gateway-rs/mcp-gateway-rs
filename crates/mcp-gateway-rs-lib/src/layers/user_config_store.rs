@@ -23,19 +23,19 @@ pub async fn user_congig_store_layer(
                 info!("Got config for user {subject} {user_config:?}");
                 request.extensions_mut().insert(user_config);
                 next.run(request).await
-            }
+            },
 
             Err(ConfigStoreError::NoDataForKey) => Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(header::CONTENT_TYPE, "text/plain")
                 .body(Body::from("Problem occured retrieving the configuration"))
-                .unwrap(),
+                .expect("Expecting this to work"),
 
             Err(_) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(header::CONTENT_TYPE, "text/plain")
                 .body(Body::from("Problem occured retrieving the configuration"))
-                .unwrap(),
+                .expect("Expecting this to work"),
         }
     } else {
         warn!("No claims");
@@ -43,6 +43,6 @@ pub async fn user_congig_store_layer(
             .status(StatusCode::BAD_REQUEST)
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("No claims in the token"))
-            .unwrap()
+            .expect("Expecting this to work")
     }
 }

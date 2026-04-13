@@ -17,13 +17,12 @@ impl<'a> AuthorizedCallValidator<'a> {
     pub fn new(call_name: &'a str, ctx: &'a RequestContext<RoleServer>) -> Self {
         Self { call_name, ctx }
     }
-    pub async fn validate(self) -> Result<(&'a VirtualHost, &'a SessionId), ErrorData> {
+    pub fn validate(self) -> Result<(&'a VirtualHost, &'a SessionId), ErrorData> {
         let maybe_parts = self.ctx.extensions.get::<Parts>();
         let maybe_session_id = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
         let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
 
-        let maybe_virtual_host_id =
-            maybe_parts.and_then(|parts| parts.extensions.get::<VirtualHostId>());
+        let maybe_virtual_host_id = maybe_parts.and_then(|parts| parts.extensions.get::<VirtualHostId>());
         info!(
             "{} user_config = {maybe_user_config:#?} session_id = {maybe_session_id:#?} virtual_host_id = {maybe_virtual_host_id:#?}",
             self.call_name
@@ -54,11 +53,7 @@ impl<'a> AuthorizedCallValidator<'a> {
         };
 
         let Some(virtual_host) = user_config.virtual_hosts.get(virtual_host_id.value()) else {
-            return Err(ErrorData {
-                code: ErrorCode::RESOURCE_NOT_FOUND,
-                message: "No configuration".into(),
-                data: None,
-            });
+            return Err(ErrorData { code: ErrorCode::RESOURCE_NOT_FOUND, message: "No configuration".into(), data: None });
         };
 
         Ok((virtual_host, session_id))

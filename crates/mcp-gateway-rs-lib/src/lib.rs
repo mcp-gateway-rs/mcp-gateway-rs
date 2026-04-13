@@ -19,12 +19,13 @@ use gateway::McpService;
 use layers::session_id::SessionId;
 
 use tower_http::cors::{Any, CorsLayer};
+use tracing::info;
 
 use crate::{
     common::{MCP_AUDIENCE, McpGatewayAppState, RedisClient, RedisConfig},
     layers::{
-        claims_id::claims_layer, session_id::SessionIdLayer,
-        user_config_store::user_congig_store_layer, virtual_host_id::virtual_host_id_layer,
+        claims_id::claims_layer, session_id::SessionIdLayer, user_config_store::user_congig_store_layer,
+        virtual_host_id::virtual_host_id_layer,
     },
     user_config_store::RedisUserConfigStore,
 };
@@ -36,26 +37,19 @@ pub async fn run_gateway(config: Config) -> Result<()> {
     let redis_client = RedisClient::open(redis_config)?;
 
     // Create streamable HTTP service
-    let mcp_service: StreamableHttpService<McpService, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(McpService::new()),
-            LocalSessionManager::default().into(),
-            StreamableHttpServerConfig::default(),
-        );
+    let mcp_service: StreamableHttpService<McpService, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(McpService::new()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
 
-    let cors_layer = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    let cors_layer = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any).expose_headers(Any);
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&[MCP_AUDIENCE]);
 
     let local_docoder = LocalDecoder::builder()
-        .keys(vec![DecodingKey::from_rsa_pem(&fs::read(
-            &config.token_verification_public_key,
-        )?)?])
+        .keys(vec![DecodingKey::from_rsa_pem(&fs::read(&config.token_verification_public_key)?)?])
         .validation(validation)
         .build()?;
     let mcp_add_state = McpGatewayAppState {
@@ -65,15 +59,9 @@ pub async fn run_gateway(config: Config) -> Result<()> {
     };
 
     let app = axum::Router::new()
-        .nest_service("/{virtual_host_name}/mcp", mcp_service)
-        .layer(middleware::from_fn_with_state(
-            mcp_add_state.clone(),
-            user_congig_store_layer,
-        ))
-        .layer(middleware::from_fn_with_state(
-            mcp_add_state.clone(),
-            claims_layer,
-        ))
+        .nest_service("/servers/{virtual_host_name}/mcp", mcp_service)
+        .layer(middleware::from_fn_with_state(mcp_add_state.clone(), user_congig_store_layer))
+        .layer(middleware::from_fn_with_state(mcp_add_state.clone(), claims_layer))
         .layer(SessionIdLayer)
         .layer(middleware::from_fn(virtual_host_id_layer))
         .layer(cors_layer);
@@ -83,6 +71,8 @@ pub async fn run_gateway(config: Config) -> Result<()> {
 
     let app = app.with_state(mcp_add_state);
 
+    let app = axum::Router::new().nest("/mcp-rs", app);
+
     // Start HTTP server
 
     let listener = tokio::net::TcpListener::bind(config.address).await?;
@@ -91,7 +81,7 @@ pub async fn run_gateway(config: Config) -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
-            println!("Shutting down...");
+            info!("Shutting down...");
         })
         .await?;
 
