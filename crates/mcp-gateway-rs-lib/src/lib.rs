@@ -8,7 +8,10 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use rmcp::transport::{
     StreamableHttpServerConfig,
     streamable_http_server::{
-        session::remote::{RedisSessionStore, RemoteSessionManager},
+        session::{
+            local::LocalSessionManager,
+            remote::{RedisSessionStore, RemoteSessionManager},
+        },
         tower::StreamableHttpService,
     },
 };
@@ -41,17 +44,15 @@ pub async fn run_gateway(config: Config) -> Result<()> {
     let redis_client = RedisClient::open(redis_config)?;
     let redis_user_session_store = RedisUserSessionStore::new(redis_client.clone());
     let redis_session_store = RedisSessionStore::new(redis_client.clone());
-    let redis_session_store_service = redis_session_store.clone();
 
     // Create streamable HTTP service
-    let mcp_service: StreamableHttpService<
-        McpService<RedisUserSessionStore, RedisSessionStore>,
-        RemoteSessionManager<RedisSessionStore>,
-    > = StreamableHttpService::new(
-        move || Ok(McpService::with_stores(redis_user_session_store.clone(), redis_session_store_service.clone())),
-        Arc::new(RemoteSessionManager::new(redis_session_store)),
-        StreamableHttpServerConfig::default(),
-    );
+    let mcp_service: StreamableHttpService<McpService<RedisUserSessionStore>, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(McpService::with_stores(redis_user_session_store.clone())),
+            //Arc::new(LORemoteSessionManager::new(redis_session_store)),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
 
     let cors_layer = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any).expose_headers(Any);
 

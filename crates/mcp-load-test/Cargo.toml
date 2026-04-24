@@ -1,0 +1,23 @@
+[package]
+name = "mcp-load-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+keywords.workspace = true
+homepage.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+
+
+[dependencies]
+goose = { git = "https://github.com/tag1consulting/goose" }
+log = "0.4.29"
+tokio.workspace = true
+http.workspace = true
+reqwest.workspace = true
+
+
+[lints]
+workspace = true

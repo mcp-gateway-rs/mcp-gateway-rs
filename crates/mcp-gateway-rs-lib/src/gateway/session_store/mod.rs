@@ -55,7 +55,7 @@ pub enum SessionStoreError {
     CantWriteData,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UserSession {
     name: &'static str,
     principal: String,

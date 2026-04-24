@@ -42,7 +42,7 @@ pub enum ConfigStoreError {
     CantWriteData,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Hash, PartialEq, PartialOrd, Ord, Eq)]
 pub struct User<'a> {
     name: &'static str,
     key: &'a str,

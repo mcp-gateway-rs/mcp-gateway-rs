@@ -1,4 +1,5 @@
 use http::request::Parts;
+//use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
 use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
 
 use tracing::info;
@@ -53,16 +54,18 @@ impl<'a> AuthorizedCallValidator<'a> {
         };
 
         let Some(virtual_host) = user_config.virtual_hosts.get(virtual_host_id.value()) else {
-            return Err(ErrorData { code: ErrorCode::RESOURCE_NOT_FOUND, message: "No configuration".into(), data: None });
+            return Err(ErrorData {
+                code: ErrorCode::RESOURCE_NOT_FOUND,
+                message: "No configuration".into(),
+                data: None,
+            });
         };
 
         Ok((virtual_host, session_id))
     }
 }
 
-
 pub struct InitializeCallValidator<'a> {
-    
     ctx: &'a RequestContext<RoleServer>,
 }
 
@@ -83,7 +86,7 @@ impl<'a> InitializeCallValidator<'a> {
         let Some(downstream_session_id) = maybe_downstream_session else {
             return Err(ErrorData {
                 code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... session id not created".into(),
+                message: "Routing problem... downstream session id not created".into(),
                 data: None,
             });
         };
@@ -103,10 +106,13 @@ impl<'a> InitializeCallValidator<'a> {
                 data: None,
             });
         };
-        
 
         let Some(virtual_host) = user_config.virtual_hosts.get(virtual_host_id.value()) else {
-            return Err(ErrorData { code: ErrorCode::RESOURCE_NOT_FOUND, message: "No configuration".into(), data: None });
+            return Err(ErrorData {
+                code: ErrorCode::RESOURCE_NOT_FOUND,
+                message: "No configuration".into(),
+                data: None,
+            });
         };
 
         Ok((virtual_host, downstream_session_id))

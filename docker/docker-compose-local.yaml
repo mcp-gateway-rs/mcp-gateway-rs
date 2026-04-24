@@ -10,67 +10,67 @@ networks:
 #  CORE SERVICE - ContextForge
 ###############################################################################
 services:
-  counter-tool-one:
-    image: mcp-rust-sdk/counter-tool:latest
-    networks: [counter-net]
-    ports: [5601:5555]
+  # counter-tool-one:
+  #   image: mcp-rust-sdk/counter-tool:latest
+  #   networks: [counter-net]
+  #   ports: [5601:5555]
 
-    environment:
-      - RUST_LOG=debug
-      - MCP_COUNTER_BIND_ADDRESS=0.0.0.0:5555
-      - MCP_COUNTER_ALLOWED_HOSTS=127.0.0.1,9.85.219.104,192.168.1.14
+  #   environment:
+  #     - RUST_LOG=debug
+  #     - MCP_COUNTER_BIND_ADDRESS=0.0.0.0:5555
+  #     - MCP_COUNTER_ALLOWED_HOSTS=127.0.0.1,9.85.219.104,192.168.1.14
             
-    sysctls:
-      - net.ipv4.tcp_fin_timeout=15
-      - net.ipv4.ip_local_port_range=1024 65535
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
+  #   sysctls:
+  #     - net.ipv4.tcp_fin_timeout=15
+  #     - net.ipv4.ip_local_port_range=1024 65535
+  #   ulimits:
+  #     nofile:
+  #       soft: 65535
+  #       hard: 65535
 
-    depends_on:
-      redis:
-        condition: service_started
+  #   depends_on:
+  #     redis:
+  #       condition: service_started
 
-    deploy:      
-      resources:
-        limits:
-          cpus: '${GATEWAY_CPU_LIMIT:-8}'
-          memory: ${GATEWAY_MEM_LIMIT:-8G}
-        reservations:
-          cpus: '${GATEWAY_CPU_RESERVATION:-4}'
-          memory: ${GATEWAY_MEM_RESERVATION:-4G}
+  #   deploy:      
+  #     resources:
+  #       limits:
+  #         cpus: '${GATEWAY_CPU_LIMIT:-8}'
+  #         memory: ${GATEWAY_MEM_LIMIT:-8G}
+  #       reservations:
+  #         cpus: '${GATEWAY_CPU_RESERVATION:-4}'
+  #         memory: ${GATEWAY_MEM_RESERVATION:-4G}
 
-  counter-tool-two:
-    image: mcp-rust-sdk/counter-tool:latest
-    networks: [counter-net]
-    ports: [5602:5555]
+  # counter-tool-two:
+  #   image: mcp-rust-sdk/counter-tool:latest
+  #   networks: [counter-net]
+  #   ports: [5602:5555]
 
-    environment:
-      - RUST_LOG=debug
-      - MCP_COUNTER_BIND_ADDRESS=0.0.0.0:5555
-      - MCP_COUNTER_ALLOWED_HOSTS=127.0.0.1,9.85.219.104,192.168.1.14
+  #   environment:
+  #     - RUST_LOG=debug
+  #     - MCP_COUNTER_BIND_ADDRESS=0.0.0.0:5555
+  #     - MCP_COUNTER_ALLOWED_HOSTS=127.0.0.1,9.85.219.104,192.168.1.14
             
-    sysctls:
-      - net.ipv4.tcp_fin_timeout=15
-      - net.ipv4.ip_local_port_range=1024 65535
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
+  #   sysctls:
+  #     - net.ipv4.tcp_fin_timeout=15
+  #     - net.ipv4.ip_local_port_range=1024 65535
+  #   ulimits:
+  #     nofile:
+  #       soft: 65535
+  #       hard: 65535
 
-    depends_on:
-      redis:
-        condition: service_started
+  #   depends_on:
+  #     redis:
+  #       condition: service_started
 
-    deploy:      
-      resources:
-        limits:
-          cpus: '${GATEWAY_CPU_LIMIT:-8}'
-          memory: ${GATEWAY_MEM_LIMIT:-8G}
-        reservations:
-          cpus: '${GATEWAY_CPU_RESERVATION:-4}'
-          memory: ${GATEWAY_MEM_RESERVATION:-4G}          
+  #   deploy:      
+  #     resources:
+  #       limits:
+  #         cpus: '${GATEWAY_CPU_LIMIT:-8}'
+  #         memory: ${GATEWAY_MEM_LIMIT:-8G}
+  #       reservations:
+  #         cpus: '${GATEWAY_CPU_RESERVATION:-4}'
+  #         memory: ${GATEWAY_MEM_RESERVATION:-4G}          
 
 
     

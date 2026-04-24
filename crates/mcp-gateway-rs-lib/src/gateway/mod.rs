@@ -4,7 +4,7 @@ mod session_store;
 use std::collections::HashMap;
 
 use http::{HeaderName, HeaderValue};
-use rmcp::transport::streamable_http_server::session::remote::SessionStore;
+
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
@@ -40,32 +40,32 @@ use crate::gateway::session_store::{SessionMapping, UserSession, UserSessionStor
 use crate::{SessionId, user_config_store::UserConfig};
 
 #[derive(Clone)]
-pub struct McpService<T, S>
+pub struct McpService<T>
 where
     T: UserSessionStore,
-    S: SessionStore,
+
 {
     subscriptions: Arc<Mutex<HashSet<String>>>,
     transports: Arc<Mutex<HashMap<BackendTransportKey, BackendTransportService>>>,
     log_level: Arc<Mutex<LoggingLevel>>,
     http_client: reqwest::Client,
     user_session_store: T,
-    session_store: S,
+    
 }
 
-impl<T, S> McpService<T, S>
+impl<T> McpService<T>
 where
     T: UserSessionStore,
-    S: SessionStore,
+
 {
-    pub fn with_stores(user_session_store: T, session_store: S) -> Self {
+    pub fn with_stores(user_session_store: T) -> Self {
         Self {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             transports: Arc::new(Mutex::new(HashMap::new())),
             log_level: Arc::new(Mutex::new(LoggingLevel::Debug)),
             http_client: reqwest::Client::new(),
             user_session_store,
-            session_store,
+
         }
     }
 }
@@ -106,10 +106,9 @@ impl From<(Option<ServerCapabilities>, Option<BackendService>)> for BackendTrans
     }
 }
 
-impl<T, S> ServerHandler for McpService<T, S>
+impl<T> ServerHandler for McpService<T>
 where
-    T: UserSessionStore + Send + Sync + 'static,
-    S: SessionStore + Send + Sync + 'static,
+    T: UserSessionStore + Send + Sync + 'static,    
 {
     async fn initialize(
         &self,
@@ -163,6 +162,7 @@ where
                         let transport = StreamableHttpClientTransport::with_client(client, config);
                         let maybe_running_service = request.serve(transport).await;
                         if let Ok(running_service) = maybe_running_service {
+                            info!("initialize: intialized for {downstream_session_id:?} {name:?}");
                             (name, Some(running_service))
                         } else {
                             warn!("initialize: Unable to initialize for {downstream_session_id:?} {name:?} {maybe_running_service:?}",);
@@ -286,7 +286,7 @@ where
         let Some(BackendToolPair { backend_name, tool_name }) = split_tool_name(&request.name, &backend_names) else {
             return Err(ErrorData {
                 code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... session id not created".into(),
+                message: "Routing problem... wrong tool name".into(),
                 data: None,
             });
         };
@@ -311,7 +311,7 @@ where
                                 let response = service.call_tool(request).await;
                                 (name, Some(service), Some(response))
                             } else {
-                                warn!("call_tool: trying to call a tool for which we have no backend");
+                                warn!("call_tool: trying to call a tool for which we have no backend {name} {backend_name} tool_name = {tool_name}");
                                 (name, None, None)
                             }
                         }),
@@ -330,7 +330,7 @@ where
 
             return Err(ErrorData {
                 code: ErrorCode::INVALID_REQUEST,
-                message: "Routing problem... session id not created".into(),
+                message: "Routing problem... multiple matching tools".into(),
                 data: None,
             });
         }
