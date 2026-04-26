@@ -75,13 +75,11 @@ async fn counter_call(user: &mut GooseUser) -> TransactionResult {
         return Err(Box::new(TransactionError::Custom("no session id".to_owned())));
     }
 
-    let calls = 10;
+    let calls = 1;
     for i in 0..calls {
         let counter_one_inc_request =
             GooseRequest::builder().set_request_builder(counter_one_increase_request(user, &session)?).build();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
+        tokio::time::sleep(Duration::from_millis(10)).await;
         match user.request(counter_one_inc_request).await?.response {
             Ok(r) => {
                 if r.status() == http::StatusCode::OK {
@@ -156,7 +154,7 @@ async fn initialize_session(user: &mut GooseUser) -> TransactionResult {
         Err(e) => return Err(Box::new(e.into())),
     };
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     session.mcp_session_id = Some(session_id.to_str().unwrap_or_default().to_owned());
     let notify_request = GooseRequest::builder().set_request_builder(notify_mcp_request(user, &session)?).build();
@@ -171,7 +169,7 @@ async fn initialize_session(user: &mut GooseUser) -> TransactionResult {
         Err(e) => return Err(Box::new(e.into())),
     }
     user.set_session_data(session);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     Ok(())
 }

@@ -70,6 +70,9 @@ pub struct Config {
     #[cfg(feature = "with_tools")]
     #[arg(long, env = "MCP_GATEWAY_TOKEN_VERIFICATION_PRIVATE_KEY")]
     pub token_verification_private_key: PathBuf,
+
+    #[arg(long, env = "MCP_GATEWAY_ENABLE_OPEN_TELEMETRY")]
+    pub enable_open_telemetry: Option<bool>,
 }
 
 #[derive(Error, Debug)]

@@ -1,23 +1,27 @@
 [package]
 name = "mcp-gateway-rs"
-version.workspace=true
+version.workspace = true
 edition.workspace = true
-rust-version.workspace =true
-license-file.workspace =true
-keywords.workspace =true
+rust-version.workspace = true
+license-file.workspace = true
+keywords.workspace = true
 
 
 [dependencies]
-mcp-gateway-rs-lib.workspace=true
-anyhow.workspace=true
-clap.workspace=true
-thiserror.workspace=true
-tracing.workspace=true
-tracing-appender.workspace=true
-tracing-opentelemetry.workspace=true
-tracing-subscriber.workspace=true
-tokio.workspace=true
-
+mcp-gateway-rs-lib.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+num_cpus = "1.17.0"
+rmcp.workspace = true
 
 [lints]
-workspace=true
+workspace = true

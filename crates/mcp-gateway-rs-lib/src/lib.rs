@@ -1,6 +1,5 @@
 use std::{fs, sync::Arc};
 
-use anyhow::Result;
 use axum::middleware;
 use axum_jwt_auth::LocalDecoder;
 
@@ -18,12 +17,15 @@ use rmcp::transport::{
 mod common;
 mod gateway;
 mod layers;
+mod tcp;
 #[cfg(feature = "with_tools")]
 mod tools;
 mod user_config_store;
 use gateway::McpService;
 use layers::session_id::SessionId;
 
+use tcp::Tcp;
+use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -39,7 +41,10 @@ use crate::{
 
 pub use crate::common::Config;
 
-pub async fn run_gateway(config: Config) -> Result<()> {
+pub async fn run_gateway(
+    config: Config,
+    local_session_manager: Arc<LocalSessionManager>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let redis_config = RedisConfig::try_from(&config)?;
     let redis_client = RedisClient::open(redis_config)?;
     let redis_user_session_store = RedisUserSessionStore::new(redis_client.clone());
@@ -50,7 +55,7 @@ pub async fn run_gateway(config: Config) -> Result<()> {
         StreamableHttpService::new(
             move || Ok(McpService::with_stores(redis_user_session_store.clone())),
             //Arc::new(LORemoteSessionManager::new(redis_session_store)),
-            Arc::new(LocalSessionManager::default()),
+            local_session_manager,
             StreamableHttpServerConfig::default(),
         );
 
@@ -84,12 +89,11 @@ pub async fn run_gateway(config: Config) -> Result<()> {
 
     let app = axum::Router::new().nest("/mcp-rs", app);
 
-    // Start HTTP server
+    let listener = Tcp::new(config.address);
 
-    let listener = tokio::net::TcpListener::bind(config.address).await?;
     tracing::info!("Server started on {}", config.address);
-
-    axum::serve(listener, app)
+    let tcp_listener: TcpListener = listener.try_into()?;
+    axum::serve(tcp_listener, app)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
             info!("Shutting down...");
