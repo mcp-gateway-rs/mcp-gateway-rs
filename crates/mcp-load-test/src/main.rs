@@ -8,9 +8,9 @@ pub const INITIALIZE_MCP_SESSION: &str = r#"{"method":"initialize","params":{"pr
 pub const NOTIFY_MCP_SESSION: &str = r#"{"method":"notifications/initialized","jsonrpc":"2.0"}"#;
 //pub const COUNTER_ONE_INC: &'static str = r#"{"method":"tools/call","params":{"name":"increment","arguments":{},"_meta":{"progressToken":1}},"jsonrpc":"2.0","id":5}"#;
 pub const COUNTER_ONE_INC: &str = r#"{"method":"tools/call","params":{"name":"counter-one-increment","arguments":{},"_meta":{"progressToken":1}},"jsonrpc":"2.0","id":1}"#;
-//pub const MCP_ENDPOINT: &str = "/mcp-rs/servers/c0ffee00f001f00lf00ldeadbeefdead/mcp";
+pub const MCP_ENDPOINT: &str = "/mcp-rs/servers/c0ffee00f001f00lf00ldeadbeefdead/mcp";
 //pub const MCP_ENDPOINT: &'static str = "/mcp";
-pub const MCP_ENDPOINT: &'static str = "/servers/b97eaa969a39421685be13ce5fa06207/mcp";
+//pub const MCP_ENDPOINT: &'static str = "/servers/b97eaa969a39421685be13ce5fa06207/mcp";
 
 #[derive(Clone, Debug)]
 struct Session {

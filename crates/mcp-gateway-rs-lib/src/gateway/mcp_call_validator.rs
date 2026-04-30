@@ -1,6 +1,9 @@
 use http::request::Parts;
 //use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
-use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
+use rmcp::{
+    ErrorData, RoleServer, model::ErrorCode, service::RequestContext,
+    transport::streamable_http_server::tower::DownstreamSessionId,
+};
 
 use tracing::info;
 

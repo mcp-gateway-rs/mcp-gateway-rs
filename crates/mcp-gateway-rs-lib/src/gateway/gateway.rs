@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
-use http::{HeaderName, HeaderValue};
-
 use std::{collections::HashSet, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver};
 
 use super::mcp_call_validator::AuthorizedCallValidator;
 use http::request::Parts;
@@ -140,7 +138,9 @@ where
             });
         };
 
-        let (downstream_session_id_channels, tasks): (Vec<_>, Vec<_>) = virtual_host
+        //&String,Receiver<Option<Arc<str>>>
+        //let (downstream_session_id_channels, tasks): (Vec<(&String,Receiver<Option<Arc<str>>>)>, Vec<_>) = virtual_host
+        let tasks: Vec<_> = virtual_host
             .backends
             .iter()
             .map(|(name, backend)| {
@@ -148,22 +148,22 @@ where
                 let request = request.clone();
                 let backend_url = backend.url.clone();
                 let downstream_session_id = downstream_session_id.clone();
-                let skip_init_config =
-                    session_mapping.get(name).map(|mapping| (mapping.session(),
-                            HashMap::<HeaderName, HeaderValue>::new(),
-                            None));
+                // let skip_init_config =
+                //     session_mapping.get(name).map(|mapping| (mapping.session(),
+                //             HashMap::<HeaderName, HeaderValue>::new(),
+                //             None::<>));
 
 
 
-                let (upstream_session_id_tx, upstream_session_id_rx) = mpsc::channel::<Option<Arc<str>>>(100);
+                //let (upstream_session_id_tx, upstream_session_id_rx) = mpsc::channel::<Option<Arc<str>>>(100);
 
-                (
-                    (name, upstream_session_id_rx),
+                //(
+                    //(name, upstream_session_id_rx),
                     Box::pin(async move {
-                        let upstream_session_id_tx = upstream_session_id_tx.clone();
-                        let mut config = StreamableHttpClientTransportConfig::with_uri(backend_url.to_string());                        
-                        config.upstream_session_id_tx = Some(upstream_session_id_tx);
-                        config.skip_init = skip_init_config;
+                        // let upstream_session_id_tx = upstream_session_id_tx.clone();
+                        let config = StreamableHttpClientTransportConfig::with_uri(backend_url.to_string());                        
+                        // config.upstream_session_id_tx = Some(upstream_session_id_tx);
+                        // config.skip_init = skip_init_config;
 
                         let transport = StreamableHttpClientTransport::with_client(client, config);
                         let maybe_running_service = request.serve(transport).await;
@@ -174,15 +174,16 @@ where
                             warn!("initialize: Unable to initialize for {downstream_session_id:?} {name:?} {maybe_running_service:?}",);
                             (name, None)
                         }
-                    }),
-                )
-            })
-            .unzip();
-        let initialization_results = futures::future::join_all(tasks).await;
+                    })
+                //)
+            }).collect();
+            //.unzip();
+        //let initialization_results : Vec<(&String, Option<RunningService<RoleClient, InitializeRequestParams>>)>= futures::future::join_all(tasks).await;
+        let initialization_results : Vec<(&String, Option<RunningService<RoleClient, InitializeRequestParams>>)>= futures::future::join_all(tasks).await;
 
         let (capabilities, backend_services): (Vec<_>, Vec<_>) = initialization_results
             .into_iter()
-            .map(|(name, running_service)| {
+            .map(|(name, running_service):(_,_)| {
                 info!("initialize: Adding transport: session_id {downstream_session_id:#?} backend {name} {running_service:?}");
 
                 let server_capabilities =
@@ -194,13 +195,14 @@ where
             })
             .unzip();
 
-        let mut session_mapping = SessionMapping::new();
-        for (host, mut session_id_rx) in downstream_session_id_channels {
-            if let Some(maybe_session_id) = session_id_rx.recv().await {
-                info!("initialize: host {host} got a session id {maybe_session_id:?}");
-                session_mapping.push(host.clone(), maybe_session_id.as_ref());
-            }
-        }
+        //Receiver<Option<Arc<str>>>
+        //let mut session_mapping = SessionMapping::new();
+        // for (host, mut session_id_rx) in downstream_session_id_channels {
+        //     if let Some(maybe_session_id) = session_id_rx.recv().await {
+        //         info!("initialize: host {host} got a session id {maybe_session_id:?}");
+        //         session_mapping.push(host.clone(), maybe_session_id.as_ref());
+        //     }
+        // }
         let _ = self
             .user_session_store
             .set_session(
