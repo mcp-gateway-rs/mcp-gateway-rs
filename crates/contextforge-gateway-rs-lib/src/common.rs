@@ -53,7 +53,7 @@ impl IntoConnectionInfo for RedisConfig {
 #[command(about = "Minimal, fast and experimental Gateway/Dataplane for ContextForge")]
 pub struct Config {
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_ADDRESS")]
-    pub address: SocketAddr,
+    pub address: Option<SocketAddr>,
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_REDIS_HOSTNAME")]
     pub redis_address: String,
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_REDIS_PORT")]
@@ -74,6 +74,15 @@ pub struct Config {
 
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_SINGLE_RUNTIME")]
     pub single_runtime: Option<bool>,
+
+    #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_TLS_ADDRESS")]
+    pub tls_address: Option<SocketAddr>,
+
+    #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_TLS_SERVER_PRIVATE_KEY")]
+    pub server_private_key: Option<PathBuf>,
+
+    #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_TLS_SERVER_CERTIFICATE")]
+    pub server_certificate: Option<PathBuf>,
 }
 
 #[derive(Error, Debug)]

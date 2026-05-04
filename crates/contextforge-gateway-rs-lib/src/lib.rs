@@ -3,6 +3,7 @@ use std::{fs, sync::Arc};
 use axum::middleware;
 use axum_jwt_auth::LocalDecoder;
 
+use futures::FutureExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use rmcp::transport::{
     StreamableHttpServerConfig,
@@ -12,7 +13,7 @@ mod common;
 mod const_values;
 mod gateway;
 mod layers;
-mod tcp;
+mod transports;
 
 #[cfg(feature = "with_tools")]
 mod tools;
@@ -21,10 +22,9 @@ mod user_config_store;
 use gateway::McpService;
 use layers::session_id::SessionId;
 
-use tcp::Tcp;
-use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+
+use transports::{DownstreamTls, Tcp};
 
 use crate::{
     common::{ContextForgeGatewayAppState, RedisClient, RedisConfig},
@@ -46,8 +46,6 @@ pub async fn run_gateway(
     let redis_config = RedisConfig::try_from(&config)?;
     let redis_client = RedisClient::open(redis_config)?;
     let user_session_store = LocalUserSessionStore::new();
-    //let user_session_store = RedisUserSessionStore::new(redis_client.clone());
-    //let redis_session_store = RedisSessionStore::new(redis_client.clone());
 
     let streamable_config = StreamableHttpServerConfig::default().disable_allowed_hosts();
 
@@ -55,7 +53,6 @@ pub async fn run_gateway(
     let mcp_service: StreamableHttpService<McpService<LocalUserSessionStore>, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(McpService::with_stores(user_session_store.clone())),
-            //Arc::new(LORemoteSessionManager::new(redis_session_store)),
             local_session_manager,
             streamable_config,
         );
@@ -87,19 +84,19 @@ pub async fn run_gateway(
     let app = tools::add_tools(app);
 
     let app = app.with_state(mcp_add_state);
-
     let app = axum::Router::new().nest("/contextforge-rs", app);
 
-    let listener = Tcp::new(config.address);
+    let mut handlers = vec![];
 
-    tracing::info!("Server started on {}", config.address);
-    let tcp_listener: TcpListener = listener.try_into()?;
-    axum::serve(tcp_listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Shutting down...");
-        })
-        .await?;
+    if let Some(tcp) = Option::<Tcp>::try_from(&config)? {
+        handlers.push(tcp.handle_tcp(app.clone()).boxed());
+    }
+
+    if let Some(tls) = Option::<DownstreamTls>::try_from(&config)? {
+        handlers.push(tls.handle_tls(app.clone()).boxed());
+    }
+
+    let _ = futures::future::join_all(handlers).await;
 
     Ok(())
 }

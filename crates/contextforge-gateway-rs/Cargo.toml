@@ -23,6 +23,7 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 num_cpus = "1.17.0"
 rmcp.workspace = true
 tikv-jemallocator = "0.6.1"
+futures.workspace = true
 
 [lints]
 workspace = true

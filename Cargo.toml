@@ -31,15 +31,7 @@ rmcp = { version = "1.5.0", features = [
     "transport-streamable-http-client-reqwest",
     "elicitation",
 ], git = "https://github.com/contextforge-gateway-rs/mcp-rust-sdk", branch = "enabling_propagation_of_new_session_id_2" }
-# rmcp = { version = "1.5.0", features = [
-#     "server",
-#     "client",
-#     "auth",
-#     "transport-streamable-http-server",
-#     "reqwest",
-#     "transport-streamable-http-client-reqwest",
-#     "elicitation",
-# ], path = "../mcp-rust-sdk/crates/rmcp" }
+
 
 serde = "1.0"
 serde_json = "1.0"
@@ -56,7 +48,7 @@ tower-layer = "0.3.3"
 tower = "0.5.3"
 http = "1.4.0"
 axum-jwt-auth = "0.6.3"
-futures = { version = "0.3", features = ["std"] }
+futures = { version = "0.3", features = ["std", "alloc"] }
 jsonwebtoken = "10.3.0"
 chrono = "0.4.44"
 redis = { version = "1.1.0", features = ["default", "tokio-rustls-comp"] }
