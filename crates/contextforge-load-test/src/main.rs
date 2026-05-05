@@ -32,6 +32,9 @@ async fn get_token(user: &mut GooseUser) -> TransactionResult {
     Ok(())
 }
 
+#[expect(dead_code, reason = "kept for load tests that use an externally supplied ContextForge JWT")]
+#[expect(clippy::unused_async, reason = "Goose transaction functions are async")]
+#[expect(clippy::unwrap_used, reason = "load test setup should fail fast when the JWT env var is missing")]
 async fn get_cf_token(user: &mut GooseUser) -> TransactionResult {
     let key = env::var("MCP_CF_JWT_KEY").unwrap();
 
@@ -100,7 +103,6 @@ async fn counter_call(user: &mut GooseUser) -> TransactionResult {
                     if !payload.contains("\"isError\":false") && !payload.contains(&format!("\"text\":\"{}\"", i + 1)) {
                         let _ = user.log_debug("Counter has a problem ", None, None, Some(&payload));
                         return Err(Box::new(TransactionError::Custom("counting problem".to_owned())));
-                    } else {
                     }
                 } else {
                     return Err(Box::new(TransactionError::Custom("wrong response code ".to_owned())));
