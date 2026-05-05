@@ -18,6 +18,7 @@ pub struct RedisUserSessionStore {
     cache: Arc<Mutex<LruCache<UserSession, SessionMapping>>>,
 }
 impl RedisUserSessionStore {
+    #[expect(dead_code, reason = "Redis-backed user sessions are implemented but not wired by default")]
     pub fn new(redis_client: RedisClient) -> Self {
         Self {
             redis_client,

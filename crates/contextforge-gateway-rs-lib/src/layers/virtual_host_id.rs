@@ -51,7 +51,10 @@ mod tests {
         assert_eq!(None, extract_virtual_host_id("/mcp/servers"));
         assert_eq!(None, extract_virtual_host_id("/servers"));
         assert_eq!(None, extract_virtual_host_id("/servers/12345_abcd-efgh/mcp/dkfjk"));
-        assert_eq!(Some(VirtualHostId { value: "12345_abcd-efgh".to_owned() }), extract_virtual_host_id("/servers/12345_abcd-efgh/mcp"));
+        assert_eq!(
+            Some(VirtualHostId { value: "12345_abcd-efgh".to_owned() }),
+            extract_virtual_host_id("/servers/12345_abcd-efgh/mcp")
+        );
         assert_eq!(None, extract_virtual_host_id("/12345_abcd-efgh/12345_abcd-efgh/mcp"));
         assert_eq!(None, extract_virtual_host_id("//12345_abcd-efgh/12345_abcd-efgh/mcp"));
     }

@@ -75,6 +75,7 @@ impl ServiceHolder {
 
 #[derive(Debug)]
 pub struct BackendTransportService {
+    #[expect(dead_code, reason = "stored backend capabilities are kept with transport state for future routing")]
     capabilities: Option<ServerCapabilities>,
     pub(crate) service: Option<BackendService>,
 }
