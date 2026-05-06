@@ -11,8 +11,14 @@ use rmcp::{
         streamable_http_server::session::local::LocalSessionManager,
     },
 };
-use std::{collections::HashMap, fs, sync::Arc};
-use tokio::sync::Semaphore;
+use rustls::crypto::{self};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    sync::Arc,
+};
+use std::{io::Read, time::Duration};
+
 use tracing::{info, warn};
 
 use crate::{
@@ -84,13 +90,10 @@ struct TestSettings {
     expected_tool_names: Vec<String>,
 }
 
-async fn create_gateway_with_four_counters(user: &str, test_semaphore: Arc<Semaphore>) -> TestSettings {
-    let gateway_port = create_ports(1)[0];
-
-    let mut config = Config::default();
-    config.address = Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work"));
-    config.token_verification_public_key = "../../assets/jwt.key.pub".into();
-
+async fn create_gateway_with_four_counters(
+    user: &str,
+    config: Config,
+) -> Result<TestSettings, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let mocked_user_config_store = MockedUserConfigStore::default();
 
     let gateway_one_ports = create_ports(2);
@@ -132,7 +135,7 @@ async fn create_gateway_with_four_counters(user: &str, test_semaphore: Arc<Semap
     mocked_user_config_store.set_config(&user_key, &user_config).await.expect("This should work");
 
     let gateway = Gateway::builder()
-        .with_config(config)
+        .with_config(config.clone())
         .with_user_config_store(Arc::new(mocked_user_config_store))
         .with_session_manager(Arc::new(LocalSessionManager::default()))
         .build();
@@ -142,7 +145,6 @@ async fn create_gateway_with_four_counters(user: &str, test_semaphore: Arc<Semap
     > = async move {
         let res = gateway.run_gateway().await;
         warn!("Gateway exited with result {res:?}");
-        test_semaphore.forget_permits(1);
         Ok(())
     }
     .boxed();
@@ -152,27 +154,40 @@ async fn create_gateway_with_four_counters(user: &str, test_semaphore: Arc<Semap
             vec![gateway].into_iter().chain(servers_one.into_iter()).chain(servers_two.into_iter()), //.chain(vec![test_future].into_iter()),
         ));
 
-    let gateway_url = format!("http://127.0.0.1:{gateway_port}/contextforge-rs/servers/{}/mcp", virtual_host_one_id);
-    TestSettings { handle, gateway_url, expected_tool_names: virtual_host_one_tool_names }
+    if let Some(address) = config.address.as_ref() {
+        let gateway_url = format!("http://{}/contextforge-rs/servers/{}/mcp", address.to_string(), virtual_host_one_id);
+        Ok(TestSettings { handle, gateway_url, expected_tool_names: virtual_host_one_tool_names })
+    } else if let Some(address) = config.tls_address.as_ref() {
+        let gateway_url =
+            format!("https://{}/contextforge-rs/servers/{}/mcp", address.to_string(), virtual_host_one_id);
+        Ok(TestSettings { handle, gateway_url, expected_tool_names: virtual_host_one_tool_names })
+    } else {
+        Err("Invalid configuration".into())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_log::test]
-async fn list_tools_end_to_end_test() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let semaphore = Arc::new(Semaphore::new(1));
-    let _ = semaphore.acquire().await.unwrap();
-    let user = "admin@example.com";
-    let test_semaphore = Arc::new(Semaphore::new(1));
-    let _ = semaphore.acquire().await.unwrap();
+async fn plaintext_list_tools_end_to_end_test() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let gateway_port = create_ports(1)[0];
 
-    let TestSettings { handle, gateway_url, expected_tool_names } =
-        create_gateway_with_four_counters(user, test_semaphore.clone()).await;
+    let mut config = Config::default();
+    config.address = Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work"));
+    config.token_verification_public_key = "../../assets/jwt.key.pub".into();
+
+    let user = "admin@example.com";
+
+    let Ok(TestSettings { handle, gateway_url, expected_tool_names }) =
+        create_gateway_with_four_counters(user, config).await
+    else {
+        panic!("Invalid configuration ");
+    };
 
     let test_future: std::pin::Pin<
         Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>> + Send>,
     > = async {
-        let _ = test_semaphore.acquire().await;
-        //tokio::time::sleep(Duration::from_millis(100)).await;
+        //let _ = test_semaphore.acquire().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
         let token = get_token(user.to_owned());
         default_headers.insert(
@@ -180,6 +195,100 @@ async fn list_tools_end_to_end_test() -> Result<(), Box<dyn std::error::Error + 
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
         );
         let client = reqwest::Client::builder().default_headers(default_headers).build().expect("This should work");
+
+        info!("Seding request to {gateway_url}");
+
+        let config = StreamableHttpClientTransportConfig::with_uri(gateway_url);
+        let transport = StreamableHttpClientTransport::with_client(client, config);
+        let request = InitializeRequestParams::default();
+
+        let maybe_service = request.serve(transport).await;
+        let Ok(running_service) = maybe_service else {
+            warn!("No Service {maybe_service:?}");
+            return Err("Couldn't get a service".into());
+        };
+
+        let list_tools = running_service.list_tools(None).await;
+        let Ok(list_tools) = list_tools else {
+            let msg = format!("List tools returned error  {list_tools:?}");
+            warn!(msg);
+            return Err(msg.into());
+        };
+
+        let mut names: Vec<String> = list_tools.tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+
+        info!("Tool names {names:#?}");
+        if expected_tool_names != names {
+            warn!("Actual {names:#?} Expected {expected_tool_names:#?}");
+            return Err("Expected tool names don't match actual".into());
+        }
+
+        Ok(())
+    }
+    .boxed();
+
+    let maybe_passed = test_future.await;
+
+    handle.abort();
+    if let Ok(_) = maybe_passed {
+        info!("Test passed");
+    } else {
+        info!("Test NOT passed {maybe_passed:?}");
+        panic!()
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[test_log::test]
+async fn tls_list_tools_end_to_end_test() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let provider = crypto::ring::default_provider();
+    _ = provider.install_default();
+    let gateway_port = create_ports(1)[0];
+
+    let mut config = Config::default();
+
+    config.token_verification_public_key = "../../assets/jwt.key.pub".into();
+
+    let server_socket_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{gateway_port}").parse().expect("This should work");
+    config.tls_address = Some(server_socket_addr.clone());
+    config.server_certificate = Some("../../assets/tls_certificate.pem".into());
+    config.server_private_key = Some("../../assets/tls_key.pem".into());
+
+    let user = "admin@example.com";
+
+    let Ok(TestSettings { handle, gateway_url, expected_tool_names }) =
+        create_gateway_with_four_counters(user, config).await
+    else {
+        panic!("Invalid configuration ");
+    };
+
+    let test_future: std::pin::Pin<
+        Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>> + Send>,
+    > = async {
+        let mut buf = Vec::new();
+        File::open("../../assets/tls_certificate.pem")?.read_to_end(&mut buf)?;
+        let cert = reqwest::Certificate::from_pem(&buf)?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut default_headers = HeaderMap::new();
+        let token = get_token(user.to_owned());
+        default_headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
+        );
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .add_root_certificate(cert)
+            .default_headers(default_headers)
+            .resolve_to_addrs("example.com", &[server_socket_addr])
+            .build()
+            .expect("This should work");
+
+        let gateway_url = gateway_url.replace("127.0.0.1", "example.com");
 
         info!("Seding request to {gateway_url}");
 
