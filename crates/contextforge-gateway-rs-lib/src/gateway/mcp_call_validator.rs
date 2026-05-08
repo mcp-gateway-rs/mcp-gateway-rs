@@ -1,3 +1,4 @@
+use contextforge_gateway_rs_apis::user_store::{UserConfig, VirtualHost};
 use http::request::Parts;
 //use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
 use rmcp::{
@@ -6,10 +7,7 @@ use rmcp::{
 };
 use tracing::info;
 
-use crate::{
-    layers::{session_id::SessionId, virtual_host_id::VirtualHostId},
-    user_config_store::{UserConfig, VirtualHost},
-};
+use crate::layers::{session_id::SessionId, virtual_host_id::VirtualHostId};
 
 pub struct AuthorizedCallValidator<'a> {
     call_name: &'a str,

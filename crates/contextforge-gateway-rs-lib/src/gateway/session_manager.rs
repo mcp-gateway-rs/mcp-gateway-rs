@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
+use contextforge_gateway_rs_apis::user_store::VirtualHost;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::mcp_gateway::{BackendTransportKey, BackendTransportService, ServiceHolder};
-use crate::{layers::session_id::SessionId, user_config_store::VirtualHost};
+use crate::layers::session_id::SessionId;
 
 pub struct SessionManager<'a> {
     virtual_host: &'a VirtualHost,

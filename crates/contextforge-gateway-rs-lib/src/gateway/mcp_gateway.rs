@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use contextforge_gateway_rs_apis::user_store::UserConfig;
 use http::request::Parts;
 use itertools::Itertools;
 use rmcp::{
@@ -31,7 +32,6 @@ use crate::{
         session_manager::SessionManager,
         session_store::{UserSession, UserSessionStore},
     },
-    user_config_store::UserConfig,
 };
 
 #[derive(Clone, TypedBuilder)]

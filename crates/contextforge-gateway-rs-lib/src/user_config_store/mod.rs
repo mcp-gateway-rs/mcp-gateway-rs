@@ -1,30 +1,9 @@
-//mod inmemory_config_store;
 mod redis_config_store;
-
-use std::collections::HashMap;
-
 use async_trait::async_trait;
-//pub use inmemory_config_store::InMemoryUserConfigStore;
+use contextforge_gateway_rs_apis::user_store::UserConfig;
+
 pub use redis_config_store::RedisUserConfigStore;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackendMCPGateway {
-    pub url: url::Url,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VirtualHost {
-    pub backends: HashMap<String, BackendMCPGateway>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserConfig {
-    pub virtual_hosts: HashMap<String, VirtualHost>,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize, thiserror::Error)]
 pub enum ConfigStoreError {
