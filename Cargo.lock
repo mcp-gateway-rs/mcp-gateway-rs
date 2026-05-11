@@ -614,7 +614,6 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 name = "contextforge-gateway-rs"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "contextforge-gateway-rs-lib",
  "futures",
@@ -663,6 +662,7 @@ dependencies = [
  "rmcp",
  "rmp-serde",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3176,7 +3176,7 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "1.6.0"
-source = "git+https://github.com/contextforge-gateway-rs/mcp-rust-sdk?branch=enabling_propagation_of_new_session_id_2#d07fa4f8d7978cd0829a09fab181437b99a81878"
+source = "git+https://github.com/contextforge-gateway-rs/mcp-rust-sdk?rev=d07fa4f8d7978cd0829a09fab181437b99a81878#d07fa4f8d7978cd0829a09fab181437b99a81878"
 dependencies = [
  "async-trait",
  "base64",
@@ -3209,7 +3209,7 @@ dependencies = [
 [[package]]
 name = "rmcp-macros"
 version = "1.6.0"
-source = "git+https://github.com/contextforge-gateway-rs/mcp-rust-sdk?branch=enabling_propagation_of_new_session_id_2#d07fa4f8d7978cd0829a09fab181437b99a81878"
+source = "git+https://github.com/contextforge-gateway-rs/mcp-rust-sdk?rev=d07fa4f8d7978cd0829a09fab181437b99a81878#d07fa4f8d7978cd0829a09fab181437b99a81878"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3326,6 +3326,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -4016,9 +4025,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.2"
+version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
  "bytes",
  "libc",
