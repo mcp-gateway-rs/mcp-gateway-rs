@@ -12,7 +12,6 @@ use clap::{Parser, ValueEnum};
 use http::uri::Authority;
 use openid::{CompactJson, CustomClaims, StandardClaims};
 use redis::{ConnectionAddr, IntoConnectionInfo, RedisError};
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
