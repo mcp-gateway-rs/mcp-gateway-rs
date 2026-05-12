@@ -633,6 +633,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextforge-gateway-rs-apis"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "contextforge-gateway-rs-lib"
 version = "0.1.0"
 dependencies = [
@@ -645,6 +655,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "contextforge-gateway-rs-apis",
  "futures",
  "http",
  "http-body",
@@ -3429,6 +3440,7 @@ dependencies = [
  "schemars_derive",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

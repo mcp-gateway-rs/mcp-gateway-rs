@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use contextforge_gateway_rs_apis::user_store::UserConfig;
 use lru_time_cache::LruCache;
 use redis::{AsyncCommands, RedisError, cmd};
 use tokio::sync::Mutex;
 
-use super::{ConfigStoreError, UserConfig, UserConfigStore};
+use super::{ConfigStoreError, UserConfigStore};
 use crate::{
     common::RedisClient,
     const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION},
