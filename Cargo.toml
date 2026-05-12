@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/contextforge-gateway-rs",
+    "crates/contextforge-gateway-rs-apis",
     "crates/contextforge-gateway-rs-lib",
     "crates/contextforge-load-test",
 ]
@@ -24,7 +25,9 @@ contextforge-gateway-rs-lib = { path = "./crates/contextforge-gateway-rs-lib", f
     "with_tools",
 ] }
 
-rmcp = { version = "1.6.0", features = [
+contextforge-gateway-rs-apis = { path = "./crates/contextforge-gateway-rs-apis"}
+rmcp = { version = "1.5.0", features = [
+
     "server",
     "client",
     "auth",
@@ -34,7 +37,7 @@ rmcp = { version = "1.6.0", features = [
     "elicitation",
 ], git = "https://github.com/contextforge-gateway-rs/mcp-rust-sdk", branch = "enabling_propagation_of_new_session_id_2", commit="d07fa4f8d7978cd0829a09fab181437b99a81878" }
 
-serde = "1.0"
+serde = {version= "1.0"}
 serde_json = "1.0"
 tracing = "0.1"
 tracing-appender = "0.2.3"

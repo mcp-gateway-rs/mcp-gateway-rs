@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use contextforge_gateway_rs_apis::user_store::UserConfig;
 use lru_time_cache::LruCache;
 use tokio::sync::Mutex;
 
-use crate::user_config_store::{ConfigStoreError, User, UserConfig, UserConfigStore};
+use crate::user_config_store::{ConfigStoreError, User, UserConfigStore};
 
 #[derive(Clone)]
 pub struct MockedUserConfigStore {
