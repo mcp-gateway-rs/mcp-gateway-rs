@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use contextforge_gateway_rs_apis::user_store::UserConfig;
+use contextforge_gateway_rs_apis::{User, user_store::UserConfig};
 use lru_time_cache::LruCache;
 use redis::{AsyncCommands, RedisError, cmd};
 use tokio::sync::Mutex;
@@ -10,7 +10,6 @@ use super::{ConfigStoreError, UserConfigStore};
 use crate::{
     common::RedisClient,
     const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION},
-    user_config_store::User,
 };
 
 #[derive(Clone)]
@@ -33,9 +32,9 @@ impl RedisUserConfigStore {
 #[async_trait]
 impl UserConfigStore for RedisUserConfigStore {
     async fn get_config<'a>(&self, user_key: &'a User) -> Result<UserConfig, ConfigStoreError> {
-        let has_key = { self.cache.lock().await.contains_key(user_key.key) };
+        let has_key = { self.cache.lock().await.contains_key(user_key.key()) };
         if has_key {
-            if let Some(user_config) = self.cache.lock().await.get_mut(user_key.key) {
+            if let Some(user_config) = self.cache.lock().await.get_mut(user_key.key()) {
                 Ok(user_config.clone())
             } else {
                 return Err(ConfigStoreError::NoDataForKey);
@@ -60,7 +59,7 @@ impl UserConfigStore for RedisUserConfigStore {
                 return Err(ConfigStoreError::DataWrongFormat);
             };
 
-            self.cache.lock().await.insert(user_key.key.to_owned(), user_config.clone());
+            self.cache.lock().await.insert(user_key.key().to_owned(), user_config.clone());
             Ok(user_config)
         }
     }
@@ -79,7 +78,7 @@ impl UserConfigStore for RedisUserConfigStore {
         };
 
         if connection.set::<&[u8], &[u8], String>(&key, &encoded).await.is_ok() {
-            self.cache.lock().await.insert(user_key.key.to_owned(), config.clone());
+            self.cache.lock().await.insert(user_key.key().to_owned(), config.clone());
             Ok(())
         } else {
             return Err(ConfigStoreError::CantWriteData);

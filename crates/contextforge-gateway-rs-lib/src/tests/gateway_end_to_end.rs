@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use contextforge_gateway_rs_apis::user_store::{BackendMCPGateway, UserConfig, VirtualHost};
+use contextforge_gateway_rs_apis::{
+    User,
+    user_store::{BackendMCPGateway, UserConfig, VirtualHost},
+};
 use futures::{FutureExt, future::BoxFuture};
 use http::{HeaderMap, HeaderValue};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -27,7 +30,7 @@ use crate::{
     Config, Gateway,
     common::DefaultClaims,
     tests::{mock_counter, mocked_user_config_store::MockedUserConfigStore},
-    user_config_store::{User, UserConfigStore},
+    user_config_store::UserConfigStore,
 };
 
 const MOCK_COUNTER_TOOL_NAMES: &[&str] =
