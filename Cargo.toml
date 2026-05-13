@@ -72,7 +72,6 @@ reqwest = "0.13"
 itertools = "0.14"
 typed-builder = "0.23.2"
 rustls = "0.23"
-# DO NOT MERGE: replace git revision with a released tag before merging.
 cpex-core = { git = "https://github.com/contextforge-org/contextforge-plugins-framework", rev = "5ae3f120eb9af227b4eac1804156cd463bcd4eee" }
 
 [profile.release]
@@ -111,6 +110,5 @@ must_use_candidate = "allow"
 print_stderr = "warn"
 print_stdout = "warn"
 str_to_string = "warn"
-string_to_string = "warn"
 todo = "warn"
 unwrap_used = "warn"
