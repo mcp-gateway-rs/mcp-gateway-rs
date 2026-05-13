@@ -31,6 +31,7 @@ Current direction:
 - Nginx/front-door routing may send only `/servers/{uuid}/mcp` traffic here while all other ContextForge traffic stays on existing CF paths.
 - Platform scope starts with MCP and should keep auth, policy, telemetry, and config ingestion reusable for A2A and LLM/model gateway traffic.
 - Plugins may need request/response payload access, not just headers. Performance-sensitive paths should keep CPU, memory, locking, and task boundaries explicit.
+- This project is still early development with no external users; prefer the right architecture over preserving unstable APIs or compatibility surfaces.
 
 ## Workspace Layers
 
