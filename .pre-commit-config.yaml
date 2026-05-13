@@ -1,0 +1,38 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --locked --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check advisories licenses
+        language: system
+        pass_filenames: false
+
+      - id: cargo-nextest
+        name: cargo nextest
+        entry: cargo nextest run --locked --workspace
+        language: system
+        pass_filenames: false
+
+      - id: cargo-build
+        name: cargo build
+        entry: cargo build --locked --workspace
+        language: system
+        pass_filenames: false
+
+      - id: cargo-bench-no-run
+        name: cargo bench --no-run
+        entry: cargo bench --locked --workspace --no-run
+        language: system
+        pass_filenames: false
