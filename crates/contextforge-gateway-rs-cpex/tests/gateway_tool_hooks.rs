@@ -88,6 +88,18 @@ async fn post_hook_receives_backend_result_and_modifies_client_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn post_hook_can_return_raw_cmf_result_content() {
+    let plugin = Arc::new(TestPlugin::new("post", vec![cmf_hook_names::TOOL_POST_INVOKE]).with_raw_post_rewrite());
+    let runtime = runtime_with_post(plugin);
+
+    let gateway = start_gateway("admin@example.com", true, runtime).await;
+    let service = gateway.connect("admin@example.com").await;
+    let result = service.call_tool(sum_request(format!("{}-sum", gateway.backend_name), 1, 2)).await.unwrap();
+
+    assert_eq!("raw-post", text(&result));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn pre_and_post_hooks_share_gateway_call_context() {
     let pre_plugin =
         Arc::new(TestPlugin::new("context-pre", vec![cmf_hook_names::TOOL_PRE_INVOKE]).with_context_roundtrip());

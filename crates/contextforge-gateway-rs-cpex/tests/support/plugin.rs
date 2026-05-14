@@ -46,6 +46,7 @@ pub(crate) enum PostBehavior {
     #[default]
     Allow,
     Rewrite,
+    RewriteRaw,
     Deny,
     RequireContext,
 }
@@ -88,6 +89,11 @@ impl TestPlugin {
 
     pub(crate) fn with_post_rewrite(mut self) -> Self {
         self.post_behavior = PostBehavior::Rewrite;
+        self
+    }
+
+    pub(crate) fn with_raw_post_rewrite(mut self) -> Self {
+        self.post_behavior = PostBehavior::RewriteRaw;
         self
     }
 
@@ -169,6 +175,15 @@ impl HookHandler<CmfHook> for TestPlugin {
                             "post:{result_text}"
                         ))]))
                         .expect("tool result serializes");
+                    }
+                    PluginResult::modify_payload(modified)
+                },
+                PostBehavior::RewriteRaw => {
+                    let mut modified = payload.clone();
+                    if let Some(ContentPart::ToolResult { content }) =
+                        modified.message.content.iter_mut().find(|part| matches!(part, ContentPart::ToolResult { .. }))
+                    {
+                        content.content = json!("raw-post");
                     }
                     PluginResult::modify_payload(modified)
                 },

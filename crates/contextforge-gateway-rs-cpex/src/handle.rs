@@ -117,6 +117,8 @@ async fn apply_runtime_config(
     config: Option<serde_json::Value>,
 ) -> Result<(), GatewayPluginRuntimeError> {
     let Some(config) = config else {
+        let old = runtime.swap(Arc::new(GatewayPluginRuntime::default()));
+        retire_runtime(old).await;
         return Ok(());
     };
     let config = serde_json::from_value(cpex_config_from_document(&config)?)
