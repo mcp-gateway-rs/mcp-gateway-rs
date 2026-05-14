@@ -52,12 +52,15 @@ pub(crate) fn tool_call_arguments(payload: &MessagePayload) -> Option<Map<String
 }
 
 pub(crate) fn tool_result_response(original: CallToolResult, payload: &MessagePayload) -> CallToolResult {
-    let mut result = payload
-        .message
-        .get_tool_results()
-        .first()
-        .and_then(|tool_result| serde_json::from_value::<CallToolResult>(tool_result.content.clone()).ok())
-        .unwrap_or(original);
+    let mut result = payload.message.get_tool_results().first().map_or(original, |tool_result| {
+        serde_json::from_value::<CallToolResult>(tool_result.content.clone()).unwrap_or_else(|_| {
+            if tool_result.is_error {
+                raw_error_tool_result(tool_result.content.clone())
+            } else {
+                raw_success_tool_result(tool_result.content.clone())
+            }
+        })
+    });
 
     let text = payload.message.get_text_content();
     if !text.is_empty() {
@@ -65,4 +68,20 @@ pub(crate) fn tool_result_response(original: CallToolResult, payload: &MessagePa
     }
 
     result
+}
+
+fn raw_success_tool_result(value: Value) -> CallToolResult {
+    if let Value::String(text) = value {
+        CallToolResult::success(vec![Content::text(text)])
+    } else {
+        CallToolResult::structured(value)
+    }
+}
+
+fn raw_error_tool_result(value: Value) -> CallToolResult {
+    if let Value::String(text) = value {
+        CallToolResult::error(vec![Content::text(text)])
+    } else {
+        CallToolResult::structured_error(value)
+    }
 }
