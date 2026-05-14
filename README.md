@@ -7,9 +7,14 @@
 docker compose -f docker/docker-compose-local.yaml up -d
 ```
 
+Check Redis and backend status:
+```bash
+docker compose -f docker/docker-compose-local.yaml ps redis gateway-one gateway-two
+```
+
 2. Run gateway
 ```bash 
-    cargo run --bin contextforge-gateway-rs -- --address 0.0.0.0:8001 --redis-port 6379 --redis-address 127.0.0.1 --token-verification-public-key assets/jwt.key.pub  --token-verification-private-key assets/jwt.key --number-of-cpus 16 --redis-mode=plain-text --upstream-connection-mode=plain-text-or-tls
+    cargo run --bin contextforge-gateway-rs -- --address 0.0.0.0:8001 --redis-port 6380 --redis-address 127.0.0.1 --token-verification-public-key assets/jwt.key.pub  --token-verification-private-key assets/jwt.key --number-of-cpus 16 --redis-mode=plain-text --upstream-connection-mode=plain-text-or-tls
 ```
 
 This should spin up Redis instance and two mcp-gateways: a simple counter and a conformance test server from mcp-rust-sdk
@@ -54,7 +59,7 @@ Runtime CPEX plugins are disabled by default. Enable hook execution when startin
 ```bash
 cargo run --release --bin contextforge-gateway-rs -- \
   --address 0.0.0.0:8001 \
-  --redis-port 6379 \
+  --redis-port 6380 \
   --redis-address 127.0.0.1 \
   --token-verification-public-key assets/jwt.key.pub \
   --token-verification-private-key assets/jwt.key \
@@ -90,12 +95,34 @@ GATEWAY_MEM_RESERVATION=512M \
 docker compose -f docker/docker-compose-local.yaml up -d
 ```
 
-Start the gateway with runtime plugins enabled:
+Check Redis and backend status:
+```bash
+docker compose -f docker/docker-compose-local.yaml ps redis gateway-one gateway-two
+```
+
+Run only one gateway process on port `8001` at a time. Stop the current gateway with `Ctrl-C` before switching between disabled and enabled plugin runs.
+
+Start the gateway with runtime plugins disabled for a baseline run:
 
 ```bash
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins --bin contextforge-gateway-rs -- \
   --address 0.0.0.0:8001 \
-  --redis-port 6379 \
+  --redis-port 6380 \
+  --redis-address 127.0.0.1 \
+  --token-verification-public-key assets/jwt.key.pub \
+  --token-verification-private-key assets/jwt.key \
+  --number-of-cpus 16 \
+  --redis-mode=plain-text \
+  --upstream-connection-mode=plain-text-or-tls \
+  --runtime-plugins-enabled false
+```
+
+Start the gateway with runtime plugins enabled for the marker run:
+
+```bash
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins --bin contextforge-gateway-rs -- \
+  --address 0.0.0.0:8001 \
+  --redis-port 6380 \
   --redis-address 127.0.0.1 \
   --token-verification-public-key assets/jwt.key.pub \
   --token-verification-private-key assets/jwt.key \
@@ -202,7 +229,13 @@ curl --silent --show-error \
   }'
 ```
 
-The response content should include the backend tool result plus an additional text part:
+With `--runtime-plugins-enabled false`, the response content should include only the backend tool result:
+
+```text
+hello
+```
+
+With `--runtime-plugins-enabled true`, the response content should include the backend tool result plus an additional text part:
 
 ```text
 [cpex:payload-marker]
