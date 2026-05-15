@@ -1,7 +1,6 @@
 mod redis_config_store;
 use async_trait::async_trait;
 use contextforge_gateway_rs_apis::{User, user_store::UserConfig};
-
 pub use redis_config_store::RedisUserConfigStore;
 use serde::{Deserialize, Serialize};
 

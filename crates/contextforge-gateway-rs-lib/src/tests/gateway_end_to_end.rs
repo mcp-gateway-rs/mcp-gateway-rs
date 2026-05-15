@@ -28,7 +28,7 @@ use tracing::{info, warn};
 
 use crate::{
     Config, Gateway,
-    common::DefaultClaims,
+    common::ContextForgeClaims,
     tests::{mock_counter, mocked_user_config_store::MockedUserConfigStore},
     user_config_store::UserConfigStore,
 };
@@ -104,15 +104,15 @@ async fn create_axum_tls_servers(ports: &[u16], router: axum::Router) -> Vec<Box
         .collect()
 }
 
-pub fn get_token(user_id: String) -> String {
+pub fn get_token(user_id: &str) -> String {
     let key = EncodingKey::from_rsa_pem(&fs::read("../../assets/jwt.key").expect("Expecting this to work"))
         .expect("Expecting this to work");
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test".to_owned());
 
-    let claims = DefaultClaims::new(user_id);
+    let claims = ContextForgeClaims::new(user_id);
 
-    encode::<DefaultClaims>(&header, &claims, &key).expect("Expecting this to work")
+    encode::<ContextForgeClaims>(&header, &claims, &key).expect("Expecting this to work")
 }
 
 struct TestSettings {
@@ -278,7 +278,7 @@ async fn plaintext_list_tools_end_to_end_test() -> crate::Result<()> {
     let test_future: BoxFuture<'_, crate::Result<()>> = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
-        let token = get_token(user.to_owned());
+        let token = get_token(user);
         default_headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
@@ -364,7 +364,7 @@ async fn tls_list_tools_end_to_end_test() -> crate::Result<()> {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
-        let token = get_token(user.to_owned());
+        let token = get_token(user);
         default_headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),

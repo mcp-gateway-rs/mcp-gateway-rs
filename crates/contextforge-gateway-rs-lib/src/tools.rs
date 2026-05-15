@@ -7,12 +7,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{Router, get, post},
 };
-use contextforge_gateway_rs_apis::{User, user_store::UserConfig};
+use contextforge_gateway_rs_apis::{User as CFUser, user_store::UserConfig};
 use http::{StatusCode, header};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
 //use tracing::debug;
-use crate::common::{ContextForgeGatewayAppState, DefaultClaims};
+use crate::common::{ContextForgeClaims, ContextForgeGatewayAppState};
 
 pub fn add_tools(router: Router<ContextForgeGatewayAppState>) -> Router<ContextForgeGatewayAppState> {
     router
@@ -30,16 +29,15 @@ pub async fn health() -> Response {
 }
 
 pub async fn get_token(State(state): State<ContextForgeGatewayAppState>, Path(user_id): Path<String>) -> Response {
-    let key = EncodingKey::from_rsa_pem(
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(
         &fs::read(&state.config.token_verification_private_key).expect("Expecting this to work"),
     )
     .expect("Expecting this to work");
-    let mut header = Header::new(Algorithm::RS256);
+
+    let claims = ContextForgeClaims::new(&user_id);
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test".to_owned());
-
-    let claims = DefaultClaims::new(user_id);
-
-    let token = encode::<DefaultClaims>(&header, &claims, &key).expect("Expecting this to work");
+    let token = jsonwebtoken::encode::<ContextForgeClaims>(&header, &claims, &key).expect("Expecting this to work");
 
     token.into_response()
 }
@@ -50,7 +48,7 @@ pub async fn configure_user(
     State(state): State<ContextForgeGatewayAppState>,
     Json(user_config): Json<UserConfig>,
 ) -> Response {
-    if state.config_store.set_config(&User::new(&user_id), &user_config).await.is_ok() {
+    if state.config_store.set_config(&CFUser::new(&user_id), &user_config).await.is_ok() {
         Response::builder()
             .status(StatusCode::ACCEPTED)
             .header(header::CONTENT_TYPE, "text/plain")

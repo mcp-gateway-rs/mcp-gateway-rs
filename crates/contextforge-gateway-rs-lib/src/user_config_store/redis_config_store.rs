@@ -8,7 +8,6 @@ use redis::{
     aio::{ConnectionManager, ConnectionManagerConfig},
     cmd,
 };
-
 use tokio::sync::Mutex;
 
 use super::{ConfigStoreError, UserConfigStore};
@@ -26,7 +25,7 @@ impl RedisUserConfigStore {
     pub async fn new(redis_client: &RedisClient) -> crate::Result<Self> {
         Ok(Self {
             connection: redis_client
-                .get_connection_manager_with_config(ConnectionManagerConfig::default())
+                .get_connection_manager_with_config(ConnectionManagerConfig::default().set_number_of_retries(1000))
                 .await
                 .map_err(|_| ConfigStoreError::InvalidConnection)?,
             cache: Arc::new(Mutex::new(LruCache::with_expiry_duration_and_capacity(
