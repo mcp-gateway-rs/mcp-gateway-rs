@@ -6,41 +6,94 @@ use std::{
     sync::Arc,
 };
 
-use axum_jwt_auth::JwtDecoder;
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use clap::{Parser, ValueEnum};
 use http::uri::Authority;
-use openid::{CompactJson, CustomClaims, StandardClaims};
+use jsonwebtoken::DecodingKey;
 use redis::{ConnectionAddr, IntoConnectionInfo, RedisError};
-
 use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use url::Url;
+use typed_builder::TypedBuilder;
+use uuid::Uuid;
 
-use crate::{const_values::CONEXT_FORGE_GATEWAY_AUDIENCE, user_config_store::UserConfigStore};
+use crate::{
+    const_values::{CONTEXT_FORGE_GATEWAY_AUDIENCE, CONTEXT_FORGE_GATEWAY_ISSUER},
+    user_config_store::UserConfigStore,
+};
+
+#[derive(Clone)]
+pub struct JwtTokenDecoders {
+    pub rs: Option<DecodingKey>,
+    pub hmac_sha: Option<DecodingKey>,
+}
 
 #[derive(Clone)]
 pub struct ContextForgeGatewayAppState {
-    pub(crate) jwt_token_decoder: Arc<dyn JwtDecoder<ContextForgeGatewayClaims> + Send + Sync>,
+    pub(crate) jwt_token_decoding_keys: JwtTokenDecoders,
     pub(crate) config_store: Arc<dyn UserConfigStore + Send + Sync>,
     pub(crate) config: Config,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ContextForgeGatewayClaims {
-    pub additional_claim: Option<String>,
-    #[serde(flatten)]
-    pub standard_claims: StandardClaims,
+#[derive(Clone, Debug, Serialize, Deserialize, TypedBuilder)]
+pub struct User {
+    email: String,
+    full_name: String,
+    is_admin: bool,
+    auth_provider: String,
 }
 
-impl CustomClaims for ContextForgeGatewayClaims {
-    fn standard_claims(&self) -> &StandardClaims {
-        &self.standard_claims
+#[derive(Clone, Debug, Serialize, Deserialize, TypedBuilder)]
+pub struct Scopes {
+    server_id: Option<String>,
+    permissions: Vec<String>,
+    ip_restrictions: Vec<String>,
+    time_restrictions: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, TypedBuilder)]
+pub struct ContextForgeClaims {
+    pub sub: String,
+    pub jti: String,
+    pub token_use: String,
+    pub iat: Option<u64>,
+    pub iss: String,
+    pub aud: String,
+    pub exp: u64,
+    pub teams: Option<Vec<String>>,
+    pub user: User,
+    pub scopes: Scopes,
+}
+
+impl ContextForgeClaims {
+    pub fn new(user_id: &str) -> Self {
+        let audience = CONTEXT_FORGE_GATEWAY_AUDIENCE.to_owned();
+        let start = std::time::SystemTime::now();
+        let now = start.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards").as_secs();
+        Self {
+            iss: CONTEXT_FORGE_GATEWAY_ISSUER.to_owned(),
+            sub: user_id.to_owned(),
+            aud: audience,
+            exp: now + Duration::hours(1).num_seconds().cast_unsigned(),
+            iat: Some(now),
+            jti: Uuid::new_v4().to_string(),
+            token_use: "api".to_owned(),
+            teams: Some(vec!["team_awesome".to_owned()]),
+            user: User::builder()
+                .email(user_id.to_owned())
+                .auth_provider("api_token".to_owned())
+                .full_name("API Token User".to_owned())
+                .is_admin(true)
+                .build(),
+            scopes: Scopes::builder()
+                .server_id(Some("my_id".to_owned()))
+                .ip_restrictions(vec!["192.169.1.0/24".to_owned()])
+                .permissions(vec!["tools.read".to_owned(), "servers.use".to_owned()])
+                .time_restrictions(None)
+                .build(),
+        }
     }
 }
-
-impl CompactJson for ContextForgeGatewayClaims {}
 
 pub type RedisClient = redis::Client;
 
@@ -115,6 +168,9 @@ pub struct Config {
     #[cfg(feature = "with_tools")]
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_TOKEN_VERIFICATION_PRIVATE_KEY")]
     pub token_verification_private_key: PathBuf,
+
+    #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_TOKEN_SECRET")]
+    pub token_verification_secret: String,
 
     #[arg(long, env = "CONTEXTFORGE_GATEWAY_RS_ENABLE_OPEN_TELEMETRY")]
     pub enable_open_telemetry: Option<bool>,
@@ -301,38 +357,12 @@ impl TryFrom<&Config> for reqwest::Client {
 fn extract_identity(config: &Config) -> crate::Result<reqwest::Identity> {
     match (config.upstream_private_key.as_ref(), config.upstream_certificate.as_ref()) {
         (Some(private_key), Some(certificate)) => {
-            let cert = fs::read(certificate)?;
+            let mut cert = fs::read(certificate)?;
             let key = fs::read(private_key)?;
-            Ok(reqwest::Identity::from_pkcs8_pem(&cert, &key)?)
+            cert.extend(key);
+            Ok(reqwest::Identity::from_pem(&cert)?)
         },
 
         _ => Err("Invalid/missing configuration".into()),
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct DefaultClaims {
-    iss: Url,
-    sub: String,
-    aud: String,
-    exp: i64,
-    iat: Option<i64>,
-    userinfo: openid::Userinfo,
-}
-
-impl DefaultClaims {
-    pub fn new(user_id: String) -> Self {
-        let url = "http://contextforge-gateway-rs".parse().expect("Expecting this to work");
-        let audience = CONEXT_FORGE_GATEWAY_AUDIENCE.to_owned();
-        let user_info = openid::Userinfo { sub: user_id.clone(), ..Default::default() };
-        Self {
-            iss: url,
-            sub: user_id,
-            aud: audience,
-            exp: (Utc::now() + Duration::hours(1)).timestamp(),
-            iat: Some(Utc::now().timestamp()),
-
-            userinfo: user_info,
-        }
     }
 }

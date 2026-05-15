@@ -1,9 +1,8 @@
 use std::{fs, sync::Arc};
 
 use axum::middleware;
-use axum_jwt_auth::LocalDecoder;
 use futures::FutureExt;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::DecodingKey;
 use rmcp::transport::{
     StreamableHttpServerConfig,
     streamable_http_server::{session::local::LocalSessionManager, tower::StreamableHttpService},
@@ -34,8 +33,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 use crate::{
-    common::ContextForgeGatewayAppState,
-    const_values::CONEXT_FORGE_GATEWAY_AUDIENCE,
+    common::{ContextForgeGatewayAppState, JwtTokenDecoders},
     gateway::LocalUserSessionStore,
     layers::{
         claims_id::claims_layer, session_id::SessionIdLayer, user_config_store::user_config_store_layer,
@@ -90,29 +88,22 @@ impl Gateway {
 
         let cors_layer = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any).expose_headers(Any);
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[CONEXT_FORGE_GATEWAY_AUDIENCE]);
+        let rs_decoding_key =
+            DecodingKey::from_rsa_pem(&fs::read(&config.token_verification_public_key).map_err(|e| {
+                format!("Error when creating local decoder {e:?} {}", config.token_verification_public_key.display())
+            })?)
+            .map_err(|e| {
+                format!("Error when creating local decoder {e:?} {}", config.token_verification_public_key.display())
+            })?;
 
-        let local_docoder = LocalDecoder::builder()
-            .keys(vec![
-                DecodingKey::from_rsa_pem(&fs::read(&config.token_verification_public_key).map_err(|e| {
-                    format!(
-                        "Error when creating local decoder {e:?} {}",
-                        config.token_verification_public_key.display()
-                    )
-                })?)
-                .map_err(|e| {
-                    format!(
-                        "Error when creating local decoder {e:?} {}",
-                        config.token_verification_public_key.display()
-                    )
-                })?,
-            ])
-            .validation(validation)
-            .build()
-            .map_err(|e| format!("Error when creating local decoder {e:?}"))?;
+        let hmac_sha_decoding_key = DecodingKey::from_secret(config.token_verification_secret.as_bytes());
+
         let mcp_add_state: ContextForgeGatewayAppState = ContextForgeGatewayAppState {
-            jwt_token_decoder: Arc::new(local_docoder),
+            jwt_token_decoding_keys: JwtTokenDecoders {
+                rs: Some(rs_decoding_key),
+                hmac_sha: Some(hmac_sha_decoding_key),
+            },
+
             config_store: Arc::clone(&user_config_store),
             config: config.clone(),
         };

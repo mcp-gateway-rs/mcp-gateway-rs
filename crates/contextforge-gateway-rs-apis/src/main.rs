@@ -1,7 +1,6 @@
 use std::fs;
 
 use contextforge_gateway_rs_apis::{User, user_store};
-
 use schemars::SchemaGenerator;
 use user_store::UserConfig;
 #[allow(clippy::print_stdout)]

@@ -1,115 +1,151 @@
-// use std::{
-//     pin::Pin,
-//     sync::Arc,
-//     task::{Context, Poll},
-// };
-
-// use axum::{
-//     body::Body,
-//     extract::{FromRequest, FromRequestParts, State},
-//     http::Request,
-//     middleware::Next,
-//     response::{IntoResponse, Response},
-// };
-// use axum_jwt_auth::{Claims, Decoder, JwtDecoder};
-// use futures::{FutureExt, future::BoxFuture};
-// use http::{StatusCode, header, request::Parts};
-// use serde::{Deserialize, Serialize, de::DeserializeOwned};
-// use tower::Service;
-
-// use tower_layer::Layer;
-// use tracing::{info, warn};
-
 use axum::{
     body::Body,
-    extract::{FromRequestParts, Request, State},
+    extract::{Request, State},
     middleware::Next,
     response::Response,
 };
-use axum_jwt_auth::Claims;
 use http::{StatusCode, header};
-use tracing::warn;
+use jsonwebtoken::Validation;
 
-use crate::common::{ContextForgeGatewayAppState, ContextForgeGatewayClaims};
-
-// #[derive(Clone)]
-// pub struct ClaimsLayer {
-//     pub decoder: Arc<dyn JwtDecoder<McpClaims> + Send + Sync + 'static>,
-// }
-
-// impl<S> Layer<S> for ClaimsLayer {
-//     type Service = ClaimsService<S>;
-
-//     fn layer(&self, service: S) -> Self::Service {
-//         ClaimsService {
-//             service,
-//             decoder: Arc::clone(&self.decoder),
-//         }
-//     }
-// }
-
-// #[derive(Clone)]
-// pub struct ClaimsService<S> {
-//     service: S,
-//     decoder: Arc<dyn JwtDecoder<McpClaims> + Send + Sync>,
-// }
-
-// impl<S, B> Service<Request<B>> for ClaimsService<S>
-// where
-//     S: Service<Request<B>> + Send + Sync + 'static + Clone,
-//     B: Send + Sync + 'static,
-// {
-//     type Response = S::Response;
-//     type Error = S::Error;
-//     type Future =
-//         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + 'static>>;
-//     //type Future = Box<dyn Future<Output = <S as Service<Request<B>>>::Future> + 'static>
-
-//     //Result<<S as Service<Request<B>>>::Response, <S as Service<Request<B>>>::Error>,
-
-//     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-//         self.service.poll_ready(cx)
-//     }
-
-//     fn call(&mut self, request: Request<B>) -> Self::Future {
-//         let (mut parts, body) = request.into_parts();
-//         let mut new_parts = parts.clone();
-//         let mut new_self = self.clone();
-//         let future = async {
-//             // if let Ok(claims) =
-//             //     Claims::<McpClaims>::from_request_parts(&mut new_parts, &new_self.decoder).await
-//             // {
-//             //     parts.extensions.insert(claims.claims);
-//             // };
-//             let request = Request::from_parts(parts, body);
-//             let response = new_self.service.call(request).await;
-//             response
-//         };
-
-//         Box::pin(future)
-//     }
-// }
+use crate::{
+    common::{ContextForgeClaims, ContextForgeGatewayAppState},
+    const_values::{CONTEXT_FORGE_GATEWAY_AUDIENCE, CONTEXT_FORGE_GATEWAY_ISSUER},
+};
 
 pub async fn claims_layer(
     State(state): State<ContextForgeGatewayAppState>,
     request: http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let decoding_keys = state.jwt_token_decoding_keys;
     let (mut parts, body) = request.into_parts();
-    let mut new_parts = parts.clone();
-    let decoder = state.jwt_token_decoder;
-    let maybe_claims = Claims::<ContextForgeGatewayClaims>::from_request_parts(&mut new_parts, &decoder).await;
-    if let Ok(claims) = maybe_claims {
-        parts.extensions.insert(claims.claims);
-        let request = Request::from_parts(parts, body);
-        next.run(request).await
-    } else {
-        let err = maybe_claims.err();
-        warn!("No claims {:?}", err);
-        Response::builder()
+    let new_parts = parts.clone();
+
+    let Some(authorization) = new_parts.headers.get("Authorization") else {
+        return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from(format!("Invalid authorization token {err:?}")))
-            .expect("Expecting this to work")
+            .body(Body::from("No authorization header"))
+            .expect("Expecting this to work");
+    };
+
+    let Some(token) = authorization.as_bytes().strip_prefix(b"Bearer ") else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Token in wrong format"))
+            .expect("Expecting this to work");
+    };
+
+    let Ok(raw_token) = str::from_utf8(token) else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Token in wrong format"))
+            .expect("Expecting this to work");
+    };
+
+    let Ok(header) = jsonwebtoken::decode_header(raw_token) else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("Invalid algorithm"))
+            .expect("Expecting this to work");
+    };
+
+    let mut validation = Validation::new(header.alg);
+    validation.set_audience(&[CONTEXT_FORGE_GATEWAY_AUDIENCE]);
+    validation.set_issuer(&[CONTEXT_FORGE_GATEWAY_ISSUER]);
+    validation.validate_exp = true;
+
+    let claims = match header.alg {
+        jsonwebtoken::Algorithm::RS256 | jsonwebtoken::Algorithm::RS384 | jsonwebtoken::Algorithm::RS512 => {
+            let Some(decoding_key) = decoding_keys.rs.as_ref() else {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(format!(
+                        "Invalid authorization token... Algorithm not supported {:?}",
+                        header.alg
+                    )))
+                    .expect("Expecting this to work");
+            };
+            let maybe_valid = jsonwebtoken::decode::<ContextForgeClaims>(raw_token, decoding_key, &validation);
+            let Ok(claims) = maybe_valid else {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(format!("Invalid authorization token... can't decode the token {maybe_valid:?}")))
+                    .expect("Expecting this to work");
+            };
+            claims
+        },
+        jsonwebtoken::Algorithm::HS256 | jsonwebtoken::Algorithm::HS384 | jsonwebtoken::Algorithm::HS512 => {
+            let Some(decoding_key) = decoding_keys.hmac_sha.as_ref() else {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(format!(
+                        "Invalid authorization token... Algorithm not supported {:?}",
+                        header.alg
+                    )))
+                    .expect("Expecting this to work");
+            };
+
+            let maybe_valid = jsonwebtoken::decode::<ContextForgeClaims>(raw_token, decoding_key, &validation);
+            let Ok(claims) = maybe_valid else {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(format!("Invalid authorization token {maybe_valid:?}")))
+                    .expect("Expecting this to work");
+            };
+
+            claims
+        },
+
+        _ => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(format!("Unsupported signing algorithm {:?}", header.alg)))
+                .expect("Expecting this to work");
+        },
+    };
+
+    let claims: ContextForgeClaims = claims.claims;
+    parts.extensions.insert(claims.clone());
+    let request = Request::from_parts(parts, body);
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod test {
+
+    use crate::{
+        common::ContextForgeClaims,
+        const_values::{CONTEXT_FORGE_GATEWAY_AUDIENCE, CONTEXT_FORGE_GATEWAY_ISSUER},
+    };
+
+    #[test]
+    fn claim_test() {
+        rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+        use jsonwebtoken::{DecodingKey, Validation};
+
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImp0aSI6Ijc1ZWYwZTZjLTZkZWMtNGExNy1hNzU3LWFlYmYzZjk1N2Q1NSIsInRva2VuX3VzZSI6ImFwaSIsImlhdCI6MTc3ODg2NTE2OCwiaXNzIjoibWNwZ2F0ZXdheSIsImF1ZCI6Im1jcGdhdGV3YXktYXBpIiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiZnVsbF9uYW1lIjoiQVBJIFRva2VuIFVzZXIiLCJpc19hZG1pbiI6dHJ1ZSwiYXV0aF9wcm92aWRlciI6ImFwaV90b2tlbiJ9LCJ0ZWFtcyI6bnVsbCwic2NvcGVzIjp7InNlcnZlcl9pZCI6bnVsbCwicGVybWlzc2lvbnMiOltdLCJpcF9yZXN0cmljdGlvbnMiOltdLCJ0aW1lX3Jlc3RyaWN0aW9ucyI6e319LCJleHAiOjE3ODE0NTcxNjh9.9d2-iLOHL2dJRFTSbOxHzuD6zLxupqK0ZkCG-3GZABU";
+
+        let Ok(header) = jsonwebtoken::decode_header(token) else {
+            panic!();
+        };
+
+        let mut validation = Validation::new(header.alg);
+        validation.set_audience(&[CONTEXT_FORGE_GATEWAY_AUDIENCE]);
+        validation.set_issuer(&[CONTEXT_FORGE_GATEWAY_ISSUER]);
+        validation.validate_exp = false;
+
+        let decoding_key = DecodingKey::from_secret("my-test-key-but-now-longer-than-32-bytes".as_bytes());
+
+        let maybe_valid = jsonwebtoken::decode::<ContextForgeClaims>(token, &decoding_key, &validation);
+        maybe_valid.expect("token invalid");
     }
 }

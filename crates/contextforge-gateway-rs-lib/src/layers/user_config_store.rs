@@ -1,11 +1,11 @@
 use axum::{body::Body, extract::State, middleware::Next, response::Response};
 use contextforge_gateway_rs_apis::User;
 use http::{StatusCode, header};
-use openid::Claims;
+//use openid::Claims;
 use tracing::{debug, info, warn};
 
 use crate::{
-    common::{ContextForgeGatewayAppState, ContextForgeGatewayClaims},
+    common::{ContextForgeClaims, ContextForgeGatewayAppState},
     user_config_store::ConfigStoreError,
 };
 
@@ -14,11 +14,11 @@ pub async fn user_config_store_layer(
     mut request: http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let maybe_claims = request.extensions().get::<ContextForgeGatewayClaims>();
+    let maybe_claims = request.extensions().get::<ContextForgeClaims>();
     if let Some(claims) = maybe_claims {
-        let subject = claims.standard_claims.sub();
-        debug!("Getting user config for {subject}");
-        match state.config_store.get_config(&User::new(subject)).await {
+        let subject = claims.sub.clone();
+        debug!("Getting user config for {subject:?}");
+        match state.config_store.get_config(&User::new(&subject)).await {
             Ok(user_config) => {
                 info!("Got config for user {subject} {user_config:?}");
                 request.extensions_mut().insert(user_config);
