@@ -12,6 +12,14 @@ use crate::{
     const_values::{CONTEXT_FORGE_GATEWAY_AUDIENCE, CONTEXT_FORGE_GATEWAY_ISSUER},
 };
 
+fn unauthorized_response() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::empty())
+        .expect("Expecting this to work")
+}
+
 pub async fn claims_layer(
     State(state): State<ContextForgeGatewayAppState>,
     request: http::Request<axum::body::Body>,
@@ -19,39 +27,14 @@ pub async fn claims_layer(
 ) -> Response {
     let decoding_keys = state.jwt_token_decoding_keys;
     let (mut parts, body) = request.into_parts();
-    let new_parts = parts.clone();
 
-    let Some(authorization) = new_parts.headers.get("Authorization") else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("No authorization header"))
-            .expect("Expecting this to work");
-    };
+    let Some(authorization) = parts.headers.get("Authorization") else { return unauthorized_response() };
 
-    let Some(token) = authorization.as_bytes().strip_prefix(b"Bearer ") else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("Token in wrong format"))
-            .expect("Expecting this to work");
-    };
+    let Some(token) = authorization.as_bytes().strip_prefix(b"Bearer ") else { return unauthorized_response() };
 
-    let Ok(raw_token) = str::from_utf8(token) else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("Token in wrong format"))
-            .expect("Expecting this to work");
-    };
+    let Ok(raw_token) = str::from_utf8(token) else { return unauthorized_response() };
 
-    let Ok(header) = jsonwebtoken::decode_header(raw_token) else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("Invalid JWT header"))
-            .expect("Expecting this to work");
-    };
+    let Ok(header) = jsonwebtoken::decode_header(raw_token) else { return unauthorized_response() };
 
     let mut validation = Validation::new(header.alg);
     validation.set_audience(&[CONTEXT_FORGE_GATEWAY_AUDIENCE]);
@@ -62,55 +45,24 @@ pub async fn claims_layer(
         jsonwebtoken::Algorithm::RS256 | jsonwebtoken::Algorithm::RS384 | jsonwebtoken::Algorithm::RS512 => {
             let Some(decoding_key) = decoding_keys.rs.as_ref() else {
                 return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
+                    .status(StatusCode::UNAUTHORIZED)
                     .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from(format!(
-                        "Invalid authorization token... Algorithm not supported {:?}",
-                        header.alg
-                    )))
+                    .body(Body::empty())
                     .expect("Expecting this to work");
             };
             let maybe_valid = jsonwebtoken::decode::<ContextForgeClaims>(raw_token, decoding_key, &validation);
-            let Ok(claims) = maybe_valid else {
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from(format!("Invalid authorization token... can't decode the token {maybe_valid:?}")))
-                    .expect("Expecting this to work");
-            };
+            let Ok(claims) = maybe_valid else { return unauthorized_response() };
             claims
         },
         jsonwebtoken::Algorithm::HS256 | jsonwebtoken::Algorithm::HS384 | jsonwebtoken::Algorithm::HS512 => {
-            let Some(decoding_key) = decoding_keys.hmac_sha.as_ref() else {
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from(format!(
-                        "Invalid authorization token... Algorithm not supported {:?}",
-                        header.alg
-                    )))
-                    .expect("Expecting this to work");
-            };
-
+            let Some(decoding_key) = decoding_keys.hmac_sha.as_ref() else { return unauthorized_response() };
             let maybe_valid = jsonwebtoken::decode::<ContextForgeClaims>(raw_token, decoding_key, &validation);
-            let Ok(claims) = maybe_valid else {
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from(format!("Invalid authorization token {maybe_valid:?}")))
-                    .expect("Expecting this to work");
-            };
+            let Ok(claims) = maybe_valid else { return unauthorized_response() };
 
             claims
         },
 
-        _ => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(format!("Unsupported signing algorithm {:?}", header.alg)))
-                .expect("Expecting this to work");
-        },
+        _ => return unauthorized_response(),
     };
 
     let claims: ContextForgeClaims = claims.claims;
