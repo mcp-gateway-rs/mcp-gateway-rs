@@ -44,6 +44,16 @@ jobs:
           tool: cargo-deny
       - run: cargo deny check advisories licenses
 
+  cargo-machete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2.75.27
+        with:
+          tool: cargo-machete
+      - run: cargo machete --with-metadata
+
   test:
     runs-on: ubuntu-latest
     steps:
