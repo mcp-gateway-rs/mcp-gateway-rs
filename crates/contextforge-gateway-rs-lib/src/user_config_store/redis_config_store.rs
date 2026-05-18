@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use super::{ConfigStoreError, UserConfigStore};
 use crate::{
     common::RedisClient,
-    const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION},
+    const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION, REDIS_RETRIES},
 };
 
 #[derive(Clone)]
@@ -21,11 +21,14 @@ pub struct RedisUserConfigStore {
     connection: ConnectionManager,
     cache: Arc<Mutex<LruCache<String, UserConfig>>>,
 }
+
 impl RedisUserConfigStore {
     pub async fn new(redis_client: &RedisClient) -> crate::Result<Self> {
         Ok(Self {
             connection: redis_client
-                .get_connection_manager_with_config(ConnectionManagerConfig::default().set_number_of_retries(1000))
+                .get_connection_manager_with_config(
+                    ConnectionManagerConfig::default().set_number_of_retries(REDIS_RETRIES),
+                )
                 .await
                 .map_err(|_| ConfigStoreError::InvalidConnection)?,
             cache: Arc::new(Mutex::new(LruCache::with_expiry_duration_and_capacity(

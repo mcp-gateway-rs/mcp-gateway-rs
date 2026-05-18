@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use super::{SessionMapping, SessionStoreError, UserSession, UserSessionStore};
 use crate::{
     common::RedisClient,
-    const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION},
+    const_values::{LRU_CACHE_ENTRIES, LRU_CACHE_EXPIRY_DURATION, REDIS_RETRIES},
 };
 
 #[derive(Clone)]
@@ -30,7 +30,9 @@ impl RedisUserSessionStore {
                 LRU_CACHE_ENTRIES,
             ))),
             connection: redis_client
-                .get_connection_manager_with_config(ConnectionManagerConfig::default())
+                .get_connection_manager_with_config(
+                    ConnectionManagerConfig::default().set_number_of_retries(REDIS_RETRIES),
+                )
                 .await
                 .map_err(|_| SessionStoreError::InvalidConnection)?,
         })
