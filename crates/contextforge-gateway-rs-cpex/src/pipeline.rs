@@ -1,4 +1,3 @@
-use contextforge_gateway_rs_lib::ToolArgumentsUpdate;
 use cpex_core::cmf::MessagePayload;
 use cpex_core::executor::PipelineResult;
 use rmcp::{
@@ -7,7 +6,10 @@ use rmcp::{
 };
 use tracing::warn;
 
-use crate::cmf::{tool_call_arguments, tool_result_response};
+use crate::{
+    ToolArgumentsUpdate,
+    cmf::{tool_call_arguments, tool_result_response},
+};
 
 pub(crate) fn modified_message_payload(result: &PipelineResult) -> Option<&MessagePayload> {
     result.modified_payload.as_ref().and_then(|payload| payload.as_any().downcast_ref::<MessagePayload>())

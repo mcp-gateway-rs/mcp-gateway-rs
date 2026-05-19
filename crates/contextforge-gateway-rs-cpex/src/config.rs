@@ -79,3 +79,35 @@ pub(crate) fn decode_config_document(config: &[u8]) -> Result<serde_json::Value,
         .or_else(|_| serde_json::from_slice::<serde_json::Value>(config))
         .map_err(|_| GatewayPluginRuntimeError::ConfigWrongFormat)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::decode_config_document;
+
+    #[test]
+    fn decode_config_document_accepts_json_bytes() {
+        let document = br#" { "version": 1, "cpex": { "plugins": [] } }"#;
+
+        assert_eq!(
+            json!({ "version": 1, "cpex": { "plugins": [] } }),
+            decode_config_document(document).expect("JSON document decodes")
+        );
+    }
+
+    #[test]
+    fn decode_config_document_accepts_messagepack_bytes() {
+        let expected = json!({ "version": 1, "cpex": { "plugins": [] } });
+        let document = rmp_serde::to_vec_named(&expected).expect("MessagePack document encodes");
+
+        assert_eq!(expected, decode_config_document(&document).expect("MessagePack document decodes"));
+    }
+
+    #[test]
+    fn decode_config_document_rejects_invalid_json_bytes() {
+        let error = decode_config_document(b"{not-json").expect_err("invalid JSON bytes are rejected");
+
+        assert_eq!("runtime plugin config is in wrong format", error.to_string());
+    }
+}

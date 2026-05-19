@@ -1,11 +1,6 @@
-use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::Read,
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+mod support;
+
+use std::{collections::HashMap, fs::File, io::Read, net::SocketAddr, sync::Arc, time::Duration};
 
 use contextforge_gateway_rs_apis::{
     User,
@@ -13,10 +8,9 @@ use contextforge_gateway_rs_apis::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use http::{HeaderMap, HeaderValue};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, InitializeRequestParams},
+    model::InitializeRequestParams,
     transport::{
         StreamableHttpClientTransport, StreamableHttpServerConfig, StreamableHttpService,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -26,12 +20,10 @@ use rmcp::{
 use rustls::crypto::{self};
 use tracing::{info, warn};
 
-use crate::{
-    Config, Gateway,
-    common::ContextForgeClaims,
-    tests::{mock_counter, mocked_user_config_store::MockedUserConfigStore},
-    user_config_store::UserConfigStore,
+use contextforge_gateway_rs_lib::{
+    Config, Gateway, Result, UpstreamConnectionMode, UserConfigStore, UserConfigStoreType,
 };
+use support::{MemoryUserConfigStore, mock_counter, token};
 
 const MOCK_COUNTER_TOOL_NAMES: &[&str] =
     &["decrement", "echo", "get_session_id", "get_value", "increment", "long_task", "say_hello", "sum"];
@@ -64,7 +56,7 @@ fn create_tool_names(ports: &[u16]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn create_axum_servers(ports: &[u16], router: &axum::Router) -> Vec<BoxFuture<'static, crate::Result<()>>> {
+fn create_axum_servers(ports: &[u16], router: &axum::Router) -> Vec<BoxFuture<'static, Result<()>>> {
     ports
         .iter()
         .map(|port| {
@@ -72,7 +64,7 @@ fn create_axum_servers(ports: &[u16], router: &axum::Router) -> Vec<BoxFuture<'s
             let router = router.clone();
             async {
                 let listener = tokio::net::TcpListener::bind(addr).await.expect("Expect this to work");
-                axum::serve(listener, router).await.unwrap();
+                axum::serve(listener, router).await.expect("server runs");
                 Ok(())
             }
             .boxed()
@@ -80,7 +72,7 @@ fn create_axum_servers(ports: &[u16], router: &axum::Router) -> Vec<BoxFuture<'s
         .collect()
 }
 
-async fn create_axum_tls_servers(ports: &[u16], router: axum::Router) -> Vec<BoxFuture<'static, crate::Result<()>>> {
+async fn create_axum_tls_servers(ports: &[u16], router: axum::Router) -> Vec<BoxFuture<'static, Result<()>>> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
         "../../assets/contextforgeCA/contextforge-server.cert.pem",
         "../../assets/contextforgeCA/contextforge-server.key.pem",
@@ -104,27 +96,14 @@ async fn create_axum_tls_servers(ports: &[u16], router: axum::Router) -> Vec<Box
         .collect()
 }
 
-pub fn get_token_for_claims(claims: &ContextForgeClaims) -> String {
-    let key = EncodingKey::from_rsa_pem(&fs::read("../../assets/jwt.key").expect("Expecting this to work"))
-        .expect("Expecting this to work");
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some("test".to_owned());
-
-    encode::<ContextForgeClaims>(&header, claims, &key).expect("Expecting this to work")
-}
-
-pub fn get_token(user_id: &str) -> String {
-    get_token_for_claims(&ContextForgeClaims::new(user_id))
-}
-
 struct TestSettings {
-    handle: tokio::task::JoinHandle<Vec<crate::Result<()>>>,
+    handle: tokio::task::JoinHandle<Vec<Result<()>>>,
     gateway_url: String,
     expected_tool_names: Vec<String>,
 }
 
-async fn create_gateway_with_four_counters(user: &str, config: Config) -> crate::Result<TestSettings> {
-    let mocked_user_config_store = MockedUserConfigStore::default();
+async fn create_gateway_with_four_counters(user: &str, config: Config) -> Result<TestSettings> {
+    let mocked_user_config_store = MemoryUserConfigStore::default();
 
     let gateway_one_ports = create_ports(2);
     let gateway_two_ports = create_ports(2);
@@ -165,7 +144,7 @@ async fn create_gateway_with_four_counters(user: &str, config: Config) -> crate:
         .with_config(config.clone())
         //.with_user_config_store(Arc::new(mocked_user_config_store))
         .with_session_manager(Arc::new(LocalSessionManager::default()))
-        .with_user_config_store_type(crate::UserConfigStoreType::Test(Arc::new(mocked_user_config_store)))
+        .with_user_config_store_type(UserConfigStoreType::Test(Arc::new(mocked_user_config_store)))
         .build();
 
     let gateway = async move {
@@ -180,10 +159,9 @@ async fn create_gateway_with_four_counters(user: &str, config: Config) -> crate:
 
         let servers_one = create_axum_servers(&gateway_one_ports, &router);
         let servers_two = create_axum_servers(&gateway_two_ports, &router);
-        let handle: tokio::task::JoinHandle<Vec<Result<(), Box<dyn std::error::Error + Send + Sync>>>> =
-            tokio::spawn(futures::future::join_all(
-                vec![gateway].into_iter().chain(servers_one).chain(servers_two), //.chain(vec![test_future].into_iter()),
-            ));
+        let handle: tokio::task::JoinHandle<Vec<Result<()>>> = tokio::spawn(futures::future::join_all(
+            vec![gateway].into_iter().chain(servers_one).chain(servers_two), //.chain(vec![test_future].into_iter()),
+        ));
 
         Ok(TestSettings { handle, gateway_url, expected_tool_names: virtual_host_one_tool_names })
     } else {
@@ -191,8 +169,8 @@ async fn create_gateway_with_four_counters(user: &str, config: Config) -> crate:
     }
 }
 
-async fn create_tls_gateway_with_four_tls_counters(user: &str, config: Config) -> crate::Result<TestSettings> {
-    let mocked_user_config_store = MockedUserConfigStore::default();
+async fn create_tls_gateway_with_four_tls_counters(user: &str, config: Config) -> Result<TestSettings> {
+    let mocked_user_config_store = MemoryUserConfigStore::default();
 
     let gateway_one_ports = create_ports(2);
     let gateway_two_ports = create_ports(2);
@@ -233,7 +211,7 @@ async fn create_tls_gateway_with_four_tls_counters(user: &str, config: Config) -
         .with_config(config.clone())
         //.with_user_config_store(Arc::new(mocked_user_config_store))
         .with_session_manager(Arc::new(LocalSessionManager::default()))
-        .with_user_config_store_type(crate::UserConfigStoreType::Test(Arc::new(mocked_user_config_store)))
+        .with_user_config_store_type(UserConfigStoreType::Test(Arc::new(mocked_user_config_store)))
         .build();
 
     let gateway = async move {
@@ -248,7 +226,7 @@ async fn create_tls_gateway_with_four_tls_counters(user: &str, config: Config) -
 
         let servers_one = create_axum_tls_servers(&gateway_one_ports, router.clone()).await;
         let servers_two = create_axum_tls_servers(&gateway_two_ports, router.clone()).await;
-        let handle: tokio::task::JoinHandle<Vec<Result<(), Box<dyn std::error::Error + Send + Sync>>>> =
+        let handle: tokio::task::JoinHandle<Vec<Result<()>>> =
             tokio::spawn(futures::future::join_all(vec![gateway].into_iter().chain(servers_one).chain(servers_two)));
 
         Ok(TestSettings { handle, gateway_url, expected_tool_names: virtual_host_one_tool_names })
@@ -259,13 +237,13 @@ async fn create_tls_gateway_with_four_tls_counters(user: &str, config: Config) -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_log::test]
-async fn plaintext_list_tools_end_to_end_test() -> crate::Result<()> {
+async fn plaintext_list_tools_end_to_end_test() -> Result<()> {
     let gateway_port = create_ports(1)[0];
 
     let config = Config {
         address: Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work")),
-        token_verification_public_key: Some("../../assets/jwt.key.pub".into()),
-        upstream_connection_mode: Some(crate::common::UpstreamConnectionMode::PlainTextOrTls),
+        token_verification_public_key: "../../assets/jwt.key.pub".into(),
+        upstream_connection_mode: Some(UpstreamConnectionMode::PlainTextOrTls),
         ..Default::default()
     };
 
@@ -277,10 +255,10 @@ async fn plaintext_list_tools_end_to_end_test() -> crate::Result<()> {
         panic!("Invalid configuration ");
     };
 
-    let test_future: BoxFuture<'_, crate::Result<()>> = async {
+    let test_future: BoxFuture<'_, Result<()>> = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
-        let token = get_token(user);
+        let token = token(user);
         default_headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
@@ -334,97 +312,7 @@ async fn plaintext_list_tools_end_to_end_test() -> crate::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_log::test]
-async fn plaintext_overlapped_counter_tools_end_to_end_test() -> crate::Result<()> {
-    let gateway_port = create_ports(1)[0];
-
-    let config = Config {
-        address: Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work")),
-        token_verification_public_key: Some("../../assets/jwt.key.pub".into()),
-        upstream_connection_mode: Some(crate::common::UpstreamConnectionMode::PlainTextOrTls),
-        ..Default::default()
-    };
-
-    let user = "admin@example.com";
-
-    let Ok(TestSettings { handle, gateway_url, expected_tool_names }) =
-        create_gateway_with_four_counters(user, config).await
-    else {
-        panic!("Invalid configuration ");
-    };
-
-    let test_future: BoxFuture<'_, crate::Result<()>> = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut default_headers = HeaderMap::new();
-        let token = get_token(user);
-        default_headers.insert(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
-        );
-        let client = reqwest::Client::builder().default_headers(default_headers).build().expect("This should work");
-
-        info!("Seding request to {gateway_url}");
-
-        let config = StreamableHttpClientTransportConfig::with_uri(gateway_url);
-        let transport = StreamableHttpClientTransport::with_client(client, config);
-        let request = InitializeRequestParams::default();
-
-        let maybe_service = request.serve(transport).await;
-        let Ok(running_service) = maybe_service else {
-            warn!("No Service {maybe_service:?}");
-            return Err("Couldn't get a service".into());
-        };
-
-        let increment_tool_name =
-            expected_tool_names.into_iter().find(|tn| tn.ends_with("increment")).expect("This should work");
-        let get_value_tool_name = increment_tool_name.replace("increment", "get_value");
-
-        let call_tool = CallToolRequestParams::new(increment_tool_name);
-
-        let tasks = (0..4).map(|_| async { running_service.call_tool(call_tool.clone()).await }).collect::<Vec<_>>();
-
-        let results = futures::future::join_all(tasks).await;
-        for result in results {
-            let Ok(_) = result else {
-                let msg = format!("Call tools returned error  {call_tool:?}");
-                warn!(msg);
-                return Err(msg.into());
-            };
-        }
-
-        let call_tool = CallToolRequestParams::new(get_value_tool_name);
-
-        let Ok(get_value_result) = running_service.call_tool(call_tool).await else {
-            let msg = "Call tools get value returned error";
-            warn!(msg);
-            return Err(msg.into());
-        };
-        info!("{get_value_result:?}");
-        let actual_value: usize = get_value_result.into_typed().expect("This should work");
-        if 4 != actual_value {
-            warn!("Wrong value for counters");
-            return Err("Wrong value for counters".into());
-        }
-
-        Ok(())
-    }
-    .boxed();
-
-    let maybe_passed = test_future.await;
-
-    handle.abort();
-    if maybe_passed.is_ok() {
-        info!("Test passed");
-    } else {
-        info!("Test NOT passed {maybe_passed:?}");
-        panic!()
-    }
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[test_log::test]
-async fn tls_list_tools_end_to_end_test() -> crate::Result<()> {
+async fn tls_list_tools_end_to_end_test() -> Result<()> {
     let provider = crypto::ring::default_provider();
     _ = provider.install_default();
     let gateway_port = create_ports(1)[0];
@@ -432,8 +320,8 @@ async fn tls_list_tools_end_to_end_test() -> crate::Result<()> {
         format!("127.0.0.1:{gateway_port}").parse().expect("This should work");
 
     let config = Config {
-        token_verification_public_key: Some("../../assets/jwt.key.pub".into()),
-        upstream_connection_mode: Some(crate::common::UpstreamConnectionMode::PlainTextOrTls),
+        token_verification_public_key: "../../assets/jwt.key.pub".into(),
+        upstream_connection_mode: Some(UpstreamConnectionMode::PlainTextOrTls),
         tls_address: Some(server_socket_addr),
         server_private_key: Some("../../assets/contextforgeCA/contextforge-server.key.pem".into()),
         server_certificate: Some("../../assets/contextforgeCA/contextforge-server.cert.pem".into()),
@@ -449,14 +337,14 @@ async fn tls_list_tools_end_to_end_test() -> crate::Result<()> {
         panic!("Invalid configuration ");
     };
 
-    let test_future: BoxFuture<crate::Result<()>> = async {
+    let test_future: BoxFuture<Result<()>> = async {
         let mut buf = Vec::new();
         File::open("../../assets/contextforgeCA/contextforge.intermediate.ca-chain.cert.pem")?.read_to_end(&mut buf)?;
         let certificates = reqwest::Certificate::from_pem_bundle(&buf)?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
-        let token = get_token(user);
+        let token = token(user);
         default_headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),

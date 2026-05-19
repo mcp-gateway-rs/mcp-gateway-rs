@@ -1,22 +1,17 @@
 use std::{
     collections::HashMap,
-    fs,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use contextforge_gateway_rs_apis::{
     User,
     user_store::{BackendMCPGateway, UserConfig, VirtualHost},
 };
 use contextforge_gateway_rs_cpex::CpexRuntimeRegistry;
-use contextforge_gateway_rs_lib::{
-    Config, ConfigStoreError, Gateway, UpstreamConnectionMode, UserConfigStore, UserConfigStoreType,
-};
+use contextforge_gateway_rs_lib::{Config, Gateway, UpstreamConnectionMode, UserConfigStore, UserConfigStoreType};
 use futures::FutureExt;
 use http::{HeaderMap, HeaderValue};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -30,25 +25,9 @@ use rmcp::{
         streamable_http_server::session::local::LocalSessionManager,
     },
 };
-use serde_json::{Map, Value, json};
-use tokio::sync::Mutex as TokioMutex;
+use serde_json::{Map, Value};
 
-#[derive(Clone, Default)]
-struct MemoryUserConfigStore {
-    configs: Arc<TokioMutex<HashMap<String, UserConfig>>>,
-}
-
-#[async_trait]
-impl UserConfigStore for MemoryUserConfigStore {
-    async fn get_config<'a>(&self, key: &'a User<'a>) -> Result<UserConfig, ConfigStoreError> {
-        self.configs.lock().await.get(key.key()).cloned().ok_or(ConfigStoreError::NoDataForKey)
-    }
-
-    async fn set_config<'a>(&self, key: &'a User<'a>, config: &'a UserConfig) -> Result<(), ConfigStoreError> {
-        self.configs.lock().await.insert(key.key().to_owned(), config.clone());
-        Ok(())
-    }
-}
+use super::{MemoryUserConfigStore, token};
 
 #[derive(Clone)]
 pub(crate) struct BackendObservation {
@@ -156,22 +135,6 @@ impl Drop for RunningGateway {
     }
 }
 
-fn token(user_id: &str) -> String {
-    let key = EncodingKey::from_rsa_pem(&fs::read("../../assets/jwt.key").expect("jwt key")).expect("encoding key");
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some("test".to_owned());
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_secs();
-    let claims = json!({
-        "iss": "http://contextforge-gateway-rs",
-        "sub": user_id,
-        "aud": "mcp-audience",
-        "exp": now + 3600,
-        "iat": now,
-        "userinfo": { "sub": user_id },
-    });
-    encode(&header, &claims, &key).expect("jwt token")
-}
-
 pub(crate) async fn start_gateway(
     user: &str,
     runtime_plugins_enabled: bool,
@@ -223,8 +186,6 @@ async fn start_gateway_with_runtime(
         .await
         .expect("user config is stored");
 
-    let gateway_plugin_runtime: Arc<dyn contextforge_gateway_rs_lib::GatewayToolRuntime> =
-        Arc::<CpexRuntimeRegistry>::clone(&plugin_runtime);
     let gateway = Gateway::builder()
         .with_config(Config {
             address: Some(format!("127.0.0.1:{gateway_port}").parse().expect("gateway address")),
@@ -235,7 +196,7 @@ async fn start_gateway_with_runtime(
         })
         .with_session_manager(Arc::new(LocalSessionManager::default()))
         .with_user_config_store_type(UserConfigStoreType::Test(Arc::new(user_store)))
-        .with_plugin_runtime(gateway_plugin_runtime)
+        .with_plugin_runtime(plugin_runtime)
         .build();
 
     let gateway = async move { gateway.run_gateway().await }.boxed();

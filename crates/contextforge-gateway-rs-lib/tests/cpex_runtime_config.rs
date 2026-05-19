@@ -2,8 +2,7 @@ mod support;
 
 use std::sync::Arc;
 
-use contextforge_gateway_rs_cpex::{CmfPluginFactory, CpexRuntimeRegistry};
-use contextforge_gateway_rs_lib::{GatewayToolRuntime, ToolArgumentsUpdate};
+use contextforge_gateway_rs_cpex::{CmfPluginFactory, CpexRuntimeRegistry, ToolArgumentsUpdate};
 use cpex_core::hooks::types::cmf_hook_names;
 use serde_json::json;
 
@@ -17,7 +16,7 @@ async fn runtime_config_store_is_loaded_on_initialize() {
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store.clone()));
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     assert!(config_store.calls() >= 1);
 }
@@ -29,7 +28,7 @@ async fn invalid_runtime_plugin_config_document_is_rejected() {
         "cpex": { "plugins": [] }
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("invalid config is rejected");
+    let error = runtime.initialize().await.expect_err("invalid config is rejected");
 
     assert_eq!("runtime plugin config is in wrong format", error.to_string());
 }
@@ -38,7 +37,7 @@ async fn invalid_runtime_plugin_config_document_is_rejected() {
 async fn raw_runtime_plugin_config_document_is_rejected() {
     let config_store = MemoryRuntimePluginConfigStore::with_config(json!({ "plugins": [] }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("raw config is rejected");
+    let error = runtime.initialize().await.expect_err("raw config is rejected");
 
     assert_eq!("runtime plugin config is in wrong format", error.to_string());
 }
@@ -54,7 +53,7 @@ async fn routed_runtime_plugin_config_is_rejected() {
         }
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("routed config is rejected");
+    let error = runtime.initialize().await.expect_err("routed config is rejected");
 
     assert_eq!("runtime plugin config is unsupported", error.to_string());
 }
@@ -73,7 +72,7 @@ async fn scoped_runtime_plugin_config_is_rejected() {
         }
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("scoped config is rejected");
+    let error = runtime.initialize().await.expect_err("scoped config is rejected");
 
     assert_eq!("runtime plugin config is unsupported", error.to_string());
 }
@@ -103,7 +102,7 @@ async fn global_policy_runtime_plugin_config_is_rejected() {
         }
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("global policy config is rejected");
+    let error = runtime.initialize().await.expect_err("global policy config is rejected");
 
     assert_eq!("runtime plugin config is unsupported", error.to_string());
 }
@@ -121,7 +120,7 @@ async fn non_tool_runtime_plugin_hook_is_rejected() {
         }
     }));
     let runtime = CpexRuntimeRegistry::with_config_store(Arc::new(config_store));
-    let error = GatewayToolRuntime::initialize(&runtime).await.expect_err("non-tool hook is rejected");
+    let error = runtime.initialize().await.expect_err("non-tool hook is rejected");
 
     assert_eq!("runtime plugin config is unsupported", error.to_string());
 }
@@ -145,7 +144,7 @@ async fn runtime_config_loads_registered_factory_plugin() {
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
     let result = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
 
     match result.arguments {
@@ -175,7 +174,7 @@ async fn runtime_config_loads_generic_cmf_factory_plugin() {
         .register_factory("generic", Box::new(CmfPluginFactory::new(TestPlugin::rewrite_from_config)))
         .expect("test factory registers");
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
     let result = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
 
     match result.arguments {

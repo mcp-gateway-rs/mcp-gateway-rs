@@ -4,6 +4,7 @@ use std::{
 };
 
 use contextforge_gateway_rs_apis::user_store::UserConfig;
+use contextforge_gateway_rs_cpex::{CpexRuntimeRegistry, ToolPreCallResult};
 use http::request::Parts;
 use itertools::Itertools;
 use rmcp::{
@@ -32,7 +33,6 @@ use crate::{
         session_manager::SessionManager,
         session_store::{UserSession, UserSessionStore},
     },
-    runtime_hooks::{GatewayToolRuntime, ToolPreCallResult},
 };
 
 #[derive(Clone, TypedBuilder)]
@@ -50,7 +50,7 @@ where
     http_client: reqwest::Client,
     user_session_store: T,
     #[builder(default)]
-    plugin_runtime: Option<Arc<dyn GatewayToolRuntime>>,
+    plugin_runtime: Option<Arc<CpexRuntimeRegistry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
