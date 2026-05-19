@@ -338,7 +338,7 @@ async fn plaintext_overlapped_counter_tools_end_to_end_test() -> crate::Result<(
 
     let config = Config {
         address: Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work")),
-        token_verification_public_key: "../../assets/jwt.key.pub".into(),
+        token_verification_public_key: Some("../../assets/jwt.key.pub".into()),
         upstream_connection_mode: Some(crate::common::UpstreamConnectionMode::PlainTextOrTls),
         ..Default::default()
     };
@@ -354,7 +354,7 @@ async fn plaintext_overlapped_counter_tools_end_to_end_test() -> crate::Result<(
     let test_future: BoxFuture<'_, crate::Result<()>> = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut default_headers = HeaderMap::new();
-        let token = get_token(user.to_owned());
+        let token = get_token(user);
         default_headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),

@@ -110,9 +110,7 @@ mod test {
     #[allow(clippy::items_after_statements)]
     async fn claim_test_valid_hmac() {
         CRYPTO.call_once(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install rustls crypto provider");
+            _ = rustls::crypto::ring::default_provider().install_default();
         });
 
         async fn handle(_: HeaderMap) -> Response {
@@ -150,9 +148,7 @@ mod test {
     #[allow(clippy::items_after_statements)]
     async fn claim_test_expired_token() {
         CRYPTO.call_once(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install rustls crypto provider");
+            _ = rustls::crypto::ring::default_provider().install_default();
         });
 
         async fn handle(_: HeaderMap) -> Response {
