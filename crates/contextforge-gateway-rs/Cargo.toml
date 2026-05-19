@@ -14,7 +14,6 @@ cpex-payload-marker = { git = "https://github.com/contextforge-gateway-rs/cpex-p
 cpex-text-prefixer = { git = "https://github.com/contextforge-gateway-rs/cpex-plugins-rs", rev = "07af215bc9f00a6c3cd6d4838479518569607581", optional = true }
 cpex-tool-namespace = { git = "https://github.com/contextforge-gateway-rs/cpex-plugins-rs", rev = "07af215bc9f00a6c3cd6d4838479518569607581", optional = true }
 clap.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-opentelemetry.workspace = true
@@ -26,7 +25,6 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 num_cpus = "1.17.0"
 rmcp.workspace = true
 tikv-jemallocator = "0.6.1"
-futures.workspace = true
 rustls.workspace = true
 
 [features]

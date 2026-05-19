@@ -16,3 +16,7 @@ schemars = {version= "1.2.1", features = ["url2","preserve_order"]}
 
 [lints]
 workspace = true
+
+[lib]
+test = false
+doctest = false
