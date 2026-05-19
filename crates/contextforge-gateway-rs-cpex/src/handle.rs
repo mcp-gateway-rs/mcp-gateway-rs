@@ -7,8 +7,6 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
-use contextforge_gateway_rs_lib::{GatewayToolRuntime, RuntimeHookState, ToolPreCallResult};
 use cpex_core::factory::{PluginFactory, PluginFactoryRegistry};
 use rmcp::{
     ErrorData,
@@ -18,6 +16,7 @@ use rmcp::{
 use crate::{
     config::{RedisRuntimePluginConfigStore, RuntimePluginConfigStore, cpex_config_from_document},
     error::GatewayPluginRuntimeError,
+    hooks::{RuntimeHookError, RuntimeHookState, ToolPreCallResult},
     runtime::GatewayPluginRuntime,
 };
 
@@ -142,15 +141,14 @@ async fn retire_runtime(runtime: Arc<GatewayPluginRuntime>) {
     });
 }
 
-#[async_trait]
-impl GatewayToolRuntime for CpexRuntimeRegistry {
-    async fn initialize(&self) -> Result<(), contextforge_gateway_rs_lib::RuntimeHookError> {
+impl CpexRuntimeRegistry {
+    pub async fn initialize(&self) -> Result<(), RuntimeHookError> {
         let initial_config = reload_runtime(&self.runtime, self.config_store.as_ref(), &self.factories).await?;
         self.start_config_watcher(initial_config);
         Ok(())
     }
 
-    async fn before_tool_call(
+    pub async fn before_tool_call(
         &self,
         request: &CallToolRequestParams,
         tool_name: &str,
@@ -163,7 +161,7 @@ impl GatewayToolRuntime for CpexRuntimeRegistry {
         Ok(result)
     }
 
-    async fn after_tool_call(
+    pub async fn after_tool_call(
         &self,
         tool_name: &str,
         response: CallToolResult,

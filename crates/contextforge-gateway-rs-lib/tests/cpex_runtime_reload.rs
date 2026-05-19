@@ -2,8 +2,7 @@ mod support;
 
 use std::sync::Arc;
 
-use contextforge_gateway_rs_cpex::CpexRuntimeRegistry;
-use contextforge_gateway_rs_lib::{GatewayToolRuntime, ToolArgumentsUpdate};
+use contextforge_gateway_rs_cpex::{CpexRuntimeRegistry, ToolArgumentsUpdate};
 use cpex_core::hooks::types::cmf_hook_names;
 use serde_json::json;
 
@@ -24,7 +23,7 @@ async fn runtime_reload_replaces_current_plugin_runtime() {
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
     let result = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
 
     assert!(matches!(result.arguments, ToolArgumentsUpdate::Unchanged));
@@ -58,7 +57,7 @@ async fn allow_pre_hook_preserves_absent_arguments() {
     runtime
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     let result = runtime
         .before_tool_call(&rmcp::model::CallToolRequestParams::new("sum"), "sum", "backend")
@@ -87,7 +86,7 @@ async fn failed_runtime_reload_keeps_current_plugin_runtime() {
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
     let result = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
     assert!(matches!(result.arguments, ToolArgumentsUpdate::Replace(Some(_))));
 
@@ -120,7 +119,7 @@ async fn runtime_reload_without_config_clears_current_plugin_runtime() {
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
 
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
     let result = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
     assert!(matches!(result.arguments, ToolArgumentsUpdate::Replace(Some(_))));
 

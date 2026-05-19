@@ -3,7 +3,6 @@ mod support;
 use std::sync::Arc;
 
 use contextforge_gateway_rs_cpex::CpexRuntimeRegistry;
-use contextforge_gateway_rs_lib::GatewayToolRuntime;
 use cpex_core::hooks::types::cmf_hook_names;
 
 use support::{MemoryRuntimePluginConfigStore, TestPlugin, TestPluginFactory, plugin_config, sum_request, text};
@@ -20,7 +19,7 @@ async fn combined_plugin_preserves_context_from_pre_to_post() {
     runtime
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     let pre = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
     let response = rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text("3")]);
@@ -45,7 +44,7 @@ async fn registry_pins_runtime_from_pre_to_post_across_replacement() {
     runtime
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     let pre = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
     config_store
@@ -74,7 +73,7 @@ async fn registry_does_not_apply_new_post_hook_to_in_flight_call() {
     runtime
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     let pre = runtime.before_tool_call(&sum_request("sum", 1, 2), "sum", "backend").await.expect("pre hook runs");
     config_store.set_config(plugin_config(&[Arc::clone(&plugin)])).await;
@@ -95,7 +94,7 @@ async fn registry_shutdowns_replaced_runtime_when_unused() {
     runtime
         .register_factory("test", Box::new(TestPluginFactory::from_plugin(&plugin)))
         .expect("test factory registers");
-    GatewayToolRuntime::initialize(&runtime).await.expect("runtime initializes");
+    runtime.initialize().await.expect("runtime initializes");
 
     config_store
         .set_config(serde_json::json!({

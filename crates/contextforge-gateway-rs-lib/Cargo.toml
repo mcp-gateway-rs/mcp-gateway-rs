@@ -10,6 +10,7 @@ keywords.workspace = true
 
 [dependencies]
 contextforge-gateway-rs-apis.workspace = true
+contextforge-gateway-rs-cpex.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -46,7 +47,6 @@ with_tools = []
 
 
 [dev-dependencies]
-contextforge-gateway-rs-cpex.workspace = true
 cpex-core.workspace = true
 openport = { version = "0.1.1", features = ["rand"] }
 test-log = "0.2.20"

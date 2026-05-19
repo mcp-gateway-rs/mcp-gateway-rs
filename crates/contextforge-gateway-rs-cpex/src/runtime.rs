@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_trait::async_trait;
-use contextforge_gateway_rs_lib::{GatewayToolRuntime, RuntimeHookState, ToolPreCallResult};
 use cpex_core::{
     cmf::{CmfHook, MessagePayload},
     config::CpexConfig,
@@ -19,6 +17,7 @@ use rmcp::{
 use crate::{
     cmf::{tool_call_payload, tool_result_payload},
     error::GatewayPluginRuntimeError,
+    hooks::{RuntimeHookState, ToolPreCallResult},
     pipeline::{effective_post_result, effective_pre_args, log_pipeline_errors, plugin_denied_error},
 };
 
@@ -120,7 +119,7 @@ impl GatewayPluginRuntime {
         result
     }
 
-    async fn before_tool_call_inner(
+    pub(crate) async fn before_tool_call(
         &self,
         request: &CallToolRequestParams,
         tool_name: &str,
@@ -142,7 +141,7 @@ impl GatewayPluginRuntime {
         Ok(ToolPreCallResult { arguments, state: Some(Box::new(state)) })
     }
 
-    async fn after_tool_call_inner(
+    pub(crate) async fn after_tool_call(
         &self,
         tool_name: &str,
         response: CallToolResult,
@@ -162,26 +161,5 @@ impl GatewayPluginRuntime {
         }
 
         Ok(effective_post_result(response, &post_result))
-    }
-}
-
-#[async_trait]
-impl GatewayToolRuntime for GatewayPluginRuntime {
-    async fn before_tool_call(
-        &self,
-        request: &CallToolRequestParams,
-        tool_name: &str,
-        backend_name: &str,
-    ) -> Result<ToolPreCallResult, ErrorData> {
-        self.before_tool_call_inner(request, tool_name, backend_name).await
-    }
-
-    async fn after_tool_call(
-        &self,
-        tool_name: &str,
-        response: CallToolResult,
-        state: Option<RuntimeHookState>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.after_tool_call_inner(tool_name, response, state).await
     }
 }

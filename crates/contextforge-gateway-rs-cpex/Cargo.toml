@@ -7,9 +7,8 @@ license.workspace = true
 keywords.workspace = true
 
 [dependencies]
-arc-swap = "1.7"
+arc-swap.workspace = true
 async-trait.workspace = true
-contextforge-gateway-rs-lib.workspace = true
 cpex-core.workspace = true
 redis.workspace = true
 rmcp.workspace = true

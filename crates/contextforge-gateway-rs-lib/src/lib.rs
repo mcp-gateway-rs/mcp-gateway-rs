@@ -11,11 +11,7 @@ mod common;
 mod const_values;
 mod gateway;
 mod layers;
-mod runtime_hooks;
 mod transports;
-
-#[cfg(test)]
-mod tests;
 
 #[cfg(feature = "with_tools")]
 mod tools;
@@ -31,9 +27,6 @@ pub use user_config_store::RedisUserConfigStore;
 pub use user_config_store::{ConfigStoreError, UserConfigStore};
 
 pub use crate::common::{Config, LogRotation};
-pub use crate::runtime_hooks::{
-    GatewayToolRuntime, RuntimeHookError, RuntimeHookState, ToolArgumentsUpdate, ToolPreCallResult,
-};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -60,7 +53,7 @@ pub struct Gateway {
     session_manager: Arc<LocalSessionManager>,
     user_config_store_type: UserConfigStoreType,
     #[builder(default, setter(strip_option))]
-    plugin_runtime: Option<Arc<dyn GatewayToolRuntime>>,
+    plugin_runtime: Option<Arc<contextforge_gateway_rs_cpex::CpexRuntimeRegistry>>,
 }
 
 impl Gateway {
