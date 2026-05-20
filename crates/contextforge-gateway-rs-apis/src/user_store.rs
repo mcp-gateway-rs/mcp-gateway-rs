@@ -26,12 +26,12 @@ pub enum IntegrationType {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct BackendMCPGateway { 
+pub struct BackendMCPGateway {
     pub name: String,
     #[serde(default)]
     pub original_name: String,
     #[serde(default)]
-    pub _computed_name: String,
+    pub computed_name: String,
     #[serde(default)]
     pub description: String,
     pub url: url::Url,
@@ -58,7 +58,7 @@ pub struct BackendMCPGateway {
     #[serde(default)]
     pub team_id: String,
     #[serde(default)]
-    pub gateway_id: String
+    pub gateway_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
