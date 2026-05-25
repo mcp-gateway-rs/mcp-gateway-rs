@@ -28,6 +28,7 @@ tikv-jemallocator = "0.6.1"
 rustls.workspace = true
 
 [features]
+with_tools = ["contextforge-gateway-rs-lib/with_tools"]
 test-plugins = ["dep:cpex-payload-marker", "dep:cpex-text-prefixer", "dep:cpex-tool-namespace"]
 
 [lints]

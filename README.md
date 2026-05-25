@@ -14,7 +14,7 @@ docker compose -f docker/docker-compose-local.yaml ps redis gateway-one gateway-
 
 2. Run gateway
 ```bash 
-    cargo run --bin contextforge-gateway-rs -- --address 0.0.0.0:8001 --redis-port 6379 --redis-address 127.0.0.1 --token-verification-public-key assets/jwt.key.pub  --token-verification-private-key assets/jwt.key --number-of-cpus 16 --redis-mode=plain-text --upstream-connection-mode=plain-text-or-tls
+    cargo run --features with_tools --bin contextforge-gateway-rs -- --address 0.0.0.0:8001 --redis-port 6379 --redis-address 127.0.0.1 --token-verification-public-key assets/jwt.key.pub  --token-verification-private-key assets/jwt.key --number-of-cpus 16 --redis-mode=plain-text --upstream-connection-mode=plain-text-or-tls
 ```
 
 This should spin up Redis instance and two mcp-gateways: a simple counter and a conformance test server from mcp-rust-sdk
@@ -62,7 +62,6 @@ cargo run --release --bin contextforge-gateway-rs -- \
   --redis-port 6379 \
   --redis-address 127.0.0.1 \
   --token-verification-public-key assets/jwt.key.pub \
-  --token-verification-private-key assets/jwt.key \
   --number-of-cpus 16 \
   --redis-mode=plain-text \
   --upstream-connection-mode=plain-text-or-tls \
@@ -80,7 +79,7 @@ This demo uses [`cpex-payload-marker`](https://github.com/contextforge-gateway-r
 Build the gateway with the demo plugin factories:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check -p contextforge-gateway-rs --features test-plugins
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check -p contextforge-gateway-rs --features test-plugins,with_tools
 ```
 
 The `test-plugins` feature includes those demo plugin crates and registers their factories through the gateway's generic CMF factory adapter.
@@ -122,7 +121,7 @@ Run only one gateway process on port `8001` at a time. Stop the current gateway 
 Start the gateway with runtime plugins disabled for a baseline run:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins --bin contextforge-gateway-rs -- \
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins,with_tools --bin contextforge-gateway-rs -- \
   --address 0.0.0.0:8001 \
   --redis-port 6379 \
   --redis-address 127.0.0.1 \
@@ -137,7 +136,7 @@ CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins --
 Start the gateway with runtime plugins enabled for the marker run:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins --bin contextforge-gateway-rs -- \
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --release --features test-plugins,with_tools --bin contextforge-gateway-rs -- \
   --address 0.0.0.0:8001 \
   --redis-port 6379 \
   --redis-address 127.0.0.1 \
