@@ -99,6 +99,7 @@ where
         let call_validator = InitializeCallValidator::new(&cx);
         let call_context = call_validator.validate()?;
         self.cleanup_notification_state(&call_context.session_key).await;
+        self.cleanup_transport_state(&call_context.session_key).await;
         let user_session = UserSession::new(
             call_context.principal.to_owned(),
             Arc::clone(&call_context.downstream_session_id.session_id),
@@ -126,7 +127,7 @@ where
                 let backend_notification_rx = backend_notifications.subscribe();
                 let backend_notifications_for_transport = backend_notifications.clone();
 
-                Box::pin(async move {
+                async move {
                     let mut headers = HashMap::new();
                     if backend_url.scheme() == "https"
                         && let Some(host) = backend_url.host_str()
@@ -145,14 +146,17 @@ where
                     let transport = StreamableHttpClientTransport::with_client(client, config);
                     let backend_client = BackendClientHandler { client_info: request, backend_notifications };
                     let maybe_running_service = backend_client.serve(transport).await;
-                    if let Ok(running_service) = maybe_running_service {
-                        info!("initialize: initialized backend {name:?}");
-                        (name, backend_notifications_for_transport, backend_notification_rx, Some(running_service))
-                    } else {
-                        warn!("initialize: unable to initialize backend {name:?}");
-                        (name, backend_notifications_for_transport, backend_notification_rx, None)
+                    match maybe_running_service {
+                        Ok(running_service) => {
+                            info!("initialize: initialized backend {name:?}");
+                            (name, backend_notifications_for_transport, backend_notification_rx, Some(running_service))
+                        },
+                        Err(error) => {
+                            warn!(?error, "initialize: unable to initialize backend {name:?}");
+                            (name, backend_notifications_for_transport, backend_notification_rx, None)
+                        },
                     }
-                })
+                }
             })
             .collect();
 
@@ -185,7 +189,11 @@ where
             })
             .unzip();
 
-        let _ = self.user_session_store.set_session(&user_session, &session_mapping).await;
+        self.user_session_store.set_session(&user_session, &session_mapping).await.map_err(|_| ErrorData {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: "Internal problem... session store can't be accessed".into(),
+            data: None,
+        })?;
 
         let mut transports = self.transports.lock().await;
         for (name, svc) in backend_services {
@@ -239,13 +247,13 @@ where
             })
             .collect::<Vec<_>>();
 
-        let responses = futures::future::join_all(list_tools_tasks).await;
-
-        let responses = responses
+        let responses = futures::future::join_all(list_tools_tasks)
+            .await
             .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
-            )
+            .filter_map(|(name, response)| {
+                debug!("list_tools: backend {name} {response:?}");
+                response.and_then(Result::ok).map(|response| (name, response))
+            })
             .collect::<Vec<_>>();
 
         let merged_list_tools = merge_tools(responses);
@@ -275,50 +283,24 @@ where
         let backend_name = backend_name.to_owned();
         let tool_name = tool_name.to_owned();
         let request_name = request.name.clone();
-        let pre_result = if let Some(plugin_runtime) = &self.plugin_runtime {
-            plugin_runtime.before_tool_call(&request, &tool_name, &backend_name).await?
-        } else {
-            ToolPreCallResult::unchanged()
-        };
-        let post_state = pre_result.state;
-        let mut routed_request = request;
-        pre_result.arguments.apply_to_request(&mut routed_request, &tool_name);
 
         let notification_rx = session_manager.subscribe_backend_notifications(&backend_name).await;
-        let backend_transports = session_manager.borrow_transports().await;
         let downstream_peer = cx.peer.clone();
         let downstream_progress_token = cx.meta.get_progress_token();
         self.ensure_notification_relay(&session_manager, &backend_name, &call_context.session_key, cx.peer.clone())
             .await;
 
-        let mut target_service = None;
-        for service_holder in backend_transports {
-            debug!(
-                "call_tool: Finding backend for {} {service_holder:?} {backend_name} tool_name = {tool_name}",
-                &request_name,
-            );
-            if service_holder.name == backend_name {
-                if target_service.is_some() {
-                    warn!("call_tool: More than one tool matching for tool name {}", request_name);
-                    session_manager.cleanup_backends("call_tool: invalid session.. duplicate tools detected").await;
-                    self.cleanup_notification_state(&call_context.session_key).await;
-                    return Err(ErrorData {
-                        code: ErrorCode::INVALID_REQUEST,
-                        message: "Routing problem... multiple matching tools".into(),
-                        data: None,
-                    });
-                }
-                target_service = Some(service_holder);
-            }
-        }
-
-        let Some(target_service) = target_service else {
+        let Some(target_service) = session_manager.borrow_transport(&backend_name).await else {
             return Err(ErrorData {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: "Routing problem... got no responses from backends".into(),
                 data: None,
             });
         };
+        debug!(
+            "call_tool: Found backend for {} {target_service:?} {backend_name} tool_name = {tool_name}",
+            &request_name,
+        );
         let Some(service) = target_service.running_service else {
             warn!(
                 "call_tool: trying to call a tool for which we have no backend {target_service:?} {backend_name} tool_name = {tool_name}"
@@ -330,27 +312,39 @@ where
             });
         };
 
+        let pre_result = if let Some(plugin_runtime) = &self.plugin_runtime {
+            plugin_runtime.before_tool_call(&request, &tool_name, &backend_name).await?
+        } else {
+            ToolPreCallResult::unchanged()
+        };
+        let post_state = pre_result.state;
+        let mut routed_request = request;
+        pre_result.arguments.apply_to_request(&mut routed_request, &tool_name);
+
+        let service_name = target_service.name;
+
         let request_handle = service
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(routed_request)),
                 PeerRequestOptions::no_options(),
             )
-            .await;
-        let response = match request_handle {
-            Ok(request_handle) => {
-                await_call_tool_response_with_notifications(
-                    notification_rx,
-                    downstream_peer,
-                    downstream_progress_token,
-                    request_handle,
-                )
-                .await
-            },
-            Err(error) => Err(error),
-        };
-        let service_name = target_service.name;
-
-        let response = response.map_err(|error| {
+            .await
+            .map_err(|error| {
+                warn!("call_tool: backend {service_name} {error:?}");
+                ErrorData {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: "Routing problem... got no responses from backends".into(),
+                    data: None,
+                }
+            })?;
+        let response = await_call_tool_response_with_notifications(
+            notification_rx,
+            downstream_peer,
+            downstream_progress_token,
+            request_handle,
+        )
+        .await
+        .map_err(|error| {
             warn!("call_tool: backend {service_name} {error:?}");
             ErrorData {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -358,14 +352,15 @@ where
                 data: None,
             }
         })?;
-        info!("call_tool: backend {service_name} completed");
 
-        match (&self.plugin_runtime, post_state) {
+        let response = match (&self.plugin_runtime, post_state) {
             (Some(plugin_runtime), Some(post_state)) => {
                 plugin_runtime.after_tool_call(&tool_name, response, Some(post_state)).await
             },
             _ => Ok(response),
-        }
+        }?;
+        info!("call_tool: backend {service_name} completed");
+        Ok(response)
     }
 
     async fn list_resources(
@@ -395,13 +390,13 @@ where
             })
             .collect::<Vec<_>>();
 
-        let responses = futures::future::join_all(list_resources_tasks).await;
-
-        let responses = responses
+        let responses = futures::future::join_all(list_resources_tasks)
+            .await
             .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
-            )
+            .filter_map(|(name, response)| {
+                debug!("list_resources: backend {name} {response:?}");
+                response.and_then(Result::ok).map(|response| (name, response))
+            })
             .collect::<Vec<_>>();
 
         let merged_list_resources = merge_resources(responses);
@@ -430,56 +425,35 @@ where
                 data: None,
             });
         };
+        let backend_name = backend_name.to_owned();
+        let resource_uri = resource_uri.to_owned();
 
-        let backend_transports = session_manager.borrow_transports().await;
-
-        let read_resource_tasks = backend_transports
-            .into_iter()
-            .filter_map(|service_holder| {
-                debug!(
-                    "read_resource: Finding backend for {} {service_holder:?} {backend_name} read_resource = {resource_uri}",
-                    &request.uri,
-                );
-                (service_holder.name == backend_name).then(|| {
-                    let mut request = request.clone();
-                    request.uri = String::from(resource_uri);
-                    async move {
-                        if let Some(service) = service_holder.running_service {
-                            let response = service.read_resource(request).await;
-
-                            (service_holder.name, Some(response))
-                        } else {
-                            warn!("call_tool: trying to call a tool for which we have no backend {service_holder:?} {backend_name} resource_name = {resource_uri}");
-                            (service_holder.name, None)
-                        }
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if read_resource_tasks.len() > 1 {
-            warn!("read_resource: More than one tool matching for tool name {}", request.uri);
-
-            session_manager.cleanup_backends("read_resource: invalid session.. duplicate resources detected").await;
-            self.cleanup_notification_state(&call_context.session_key).await;
-
+        let Some(service_holder) = session_manager.borrow_transport(&backend_name).await else {
             return Err(ErrorData {
-                code: ErrorCode::INVALID_REQUEST,
-                message: "Routing problem... multiple matching resources".into(),
+                code: ErrorCode::INTERNAL_ERROR,
+                message: "Routing problem... got no responses from backends".into(),
                 data: None,
             });
-        }
-
-        let responses = futures::future::join_all(read_resource_tasks).await;
-
-        let responses = responses
-            .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
-            )
-            .collect::<Vec<_>>();
-
-        responses.into_iter().next().map(|(_, r)| r).ok_or(ErrorData {
+        };
+        debug!(
+            "read_resource: Found backend for {} {service_holder:?} {backend_name} read_resource = {resource_uri}",
+            &request.uri,
+        );
+        let Some(service) = service_holder.running_service else {
+            warn!(
+                "read_resource: trying to read a resource for which we have no backend {service_holder:?} {backend_name} resource_name = {resource_uri}"
+            );
+            return Err(ErrorData {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: "Routing problem... got no responses from backends".into(),
+                data: None,
+            });
+        };
+        let mut request = request;
+        request.uri = resource_uri;
+        let response = service.read_resource(request).await;
+        debug!("read_resource: backend {backend_name} {response:?}");
+        response.map_err(|_| ErrorData {
             code: ErrorCode::INTERNAL_ERROR,
             message: "Routing problem... got no responses from backends".into(),
             data: None,
@@ -520,8 +494,8 @@ where
             SessionManager::new(call_context.virtual_host, &call_context.session_key, &self.transports);
         let (backend_name, resource_uri) = resource_subscription_target(&session_manager, &request.uri)?;
 
-        self.stop_notification_relay(&backend_name, &call_context.session_key).await;
         let buffered_notifications = session_manager.subscribe_backend_notifications(&backend_name).await;
+        self.stop_notification_relay(&backend_name, &call_context.session_key).await;
 
         if let Err(error) = forward_resource_subscription(
             &session_manager,
@@ -531,8 +505,23 @@ where
         )
         .await
         {
-            self.ensure_notification_relay(&session_manager, &backend_name, &call_context.session_key, cx.peer.clone())
+            if let Some(notification_rx) = buffered_notifications {
+                self.drain_then_spawn_notification_relay(
+                    notification_rx,
+                    backend_name,
+                    call_context.session_key,
+                    cx.peer.clone(),
+                )
                 .await;
+            } else {
+                self.ensure_notification_relay(
+                    &session_manager,
+                    &backend_name,
+                    &call_context.session_key,
+                    cx.peer.clone(),
+                )
+                .await;
+            }
             return Err(error);
         }
 
@@ -544,18 +533,17 @@ where
             .insert(request.uri.clone());
 
         if let Some(notification_rx) = buffered_notifications {
-            drain_buffered_session_notifications(SessionNotificationRelay {
+            self.drain_then_spawn_notification_relay(
                 notification_rx,
-                backend_name: backend_name.clone(),
-                downstream_peer: cx.peer.clone(),
-                resource_subscriptions: Arc::clone(&self.subscriptions),
-                log_levels: Arc::clone(&self.log_levels),
-                session_key: call_context.session_key.clone(),
-            })
+                backend_name,
+                call_context.session_key,
+                cx.peer.clone(),
+            )
             .await;
+        } else {
+            self.ensure_notification_relay(&session_manager, &backend_name, &call_context.session_key, cx.peer.clone())
+                .await;
         }
-        self.ensure_notification_relay(&session_manager, &backend_name, &call_context.session_key, cx.peer.clone())
-            .await;
 
         Ok(())
     }
@@ -570,15 +558,49 @@ where
         let session_manager =
             SessionManager::new(call_context.virtual_host, &call_context.session_key, &self.transports);
         let (backend_name, resource_uri) = resource_subscription_target(&session_manager, &request.uri)?;
-        forward_resource_subscription(
+        let buffered_notifications = session_manager.subscribe_backend_notifications(&backend_name).await;
+        self.stop_notification_relay(&backend_name, &call_context.session_key).await;
+        if let Err(error) = forward_resource_subscription(
             &session_manager,
             &backend_name,
             &resource_uri,
             ResourceSubscriptionAction::Unsubscribe,
         )
-        .await?;
+        .await
+        {
+            if let Some(notification_rx) = buffered_notifications {
+                self.drain_then_spawn_notification_relay(
+                    notification_rx,
+                    backend_name,
+                    call_context.session_key,
+                    cx.peer.clone(),
+                )
+                .await;
+            } else {
+                self.ensure_notification_relay(
+                    &session_manager,
+                    &backend_name,
+                    &call_context.session_key,
+                    cx.peer.clone(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
 
         remove_resource_subscription(&self.subscriptions, &call_context.session_key, request.uri.as_str()).await;
+        if let Some(notification_rx) = buffered_notifications {
+            self.drain_then_spawn_notification_relay(
+                notification_rx,
+                backend_name,
+                call_context.session_key,
+                cx.peer.clone(),
+            )
+            .await;
+        } else {
+            self.ensure_notification_relay(&session_manager, &backend_name, &call_context.session_key, cx.peer.clone())
+                .await;
+        }
         Ok(())
     }
 
@@ -729,6 +751,28 @@ where
             .await;
     }
 
+    async fn drain_then_spawn_notification_relay(
+        &self,
+        notification_rx: broadcast::Receiver<BackendNotification>,
+        backend_name: String,
+        session_key: SessionKey,
+        downstream_peer: Peer<RoleServer>,
+    ) {
+        let Some(notification_rx) = drain_buffered_session_notifications(SessionNotificationRelay {
+            notification_rx,
+            backend_name: backend_name.clone(),
+            downstream_peer: downstream_peer.clone(),
+            resource_subscriptions: Arc::clone(&self.subscriptions),
+            log_levels: Arc::clone(&self.log_levels),
+            session_key: session_key.clone(),
+        })
+        .await
+        else {
+            return;
+        };
+        self.spawn_notification_relay(notification_rx, backend_name, session_key, downstream_peer).await;
+    }
+
     async fn spawn_notification_relay(
         &self,
         notification_rx: broadcast::Receiver<BackendNotification>,
@@ -774,8 +818,10 @@ where
 
     async fn stop_notification_relay(&self, backend_name: &str, session_key: &SessionKey) {
         let key = BackendTransportKey::from((backend_name, session_key));
-        if let Some(handle) = self.notification_relays.lock().await.remove(&key) {
+        let handle = self.notification_relays.lock().await.remove(&key);
+        if let Some(handle) = handle {
             handle.abort();
+            let _ = handle.await;
         }
     }
 
@@ -786,6 +832,10 @@ where
 
     async fn cleanup_notification_state(&self, session_key: &SessionKey) {
         cleanup_notification_state(&self.subscriptions, &self.log_levels, &self.notification_relays, session_key).await;
+    }
+
+    async fn cleanup_transport_state(&self, session_key: &SessionKey) {
+        self.transports.lock().await.retain(|key, _| &key.session_key != session_key);
     }
 }
 
@@ -798,12 +848,14 @@ async fn cleanup_notification_state(
     subscriptions.lock().await.remove(session_key);
     log_levels.lock().await.remove(session_key);
     let mut relays = notification_relays.lock().await;
-    let keys = relays.keys().filter(|key| key.session_key == *session_key).cloned().collect::<Vec<_>>();
-    for key in keys {
-        if let Some(handle) = relays.remove(&key) {
+    relays.retain(|key, handle| {
+        if &key.session_key == session_key {
             handle.abort();
+            false
+        } else {
+            true
         }
-    }
+    });
 }
 
 async fn remove_resource_subscription(
@@ -861,29 +913,28 @@ async fn forward_resource_subscription(
     resource_uri: &str,
     action: ResourceSubscriptionAction,
 ) -> Result<(), ErrorData> {
-    let backend_transports = session_manager.borrow_transports().await;
-    let mut response = None;
-    for service_holder in backend_transports {
-        if service_holder.name == backend_name
-            && let Some(service) = service_holder.running_service
-        {
-            response = Some(match action {
-                ResourceSubscriptionAction::Subscribe => {
-                    service.subscribe(SubscribeRequestParams::new(resource_uri.to_owned())).await
-                },
-                ResourceSubscriptionAction::Unsubscribe => {
-                    service.unsubscribe(UnsubscribeRequestParams::new(resource_uri.to_owned())).await
-                },
-            });
-        }
-    }
-
-    let Some(response) = response else {
+    let Some(service_holder) = session_manager.borrow_transport(backend_name).await else {
         return Err(ErrorData {
             code: ErrorCode::INTERNAL_ERROR,
             message: "Routing problem... got no response from backend".into(),
             data: None,
         });
+    };
+    let Some(service) = service_holder.running_service else {
+        return Err(ErrorData {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: "Routing problem... got no response from backend".into(),
+            data: None,
+        });
+    };
+
+    let response = match action {
+        ResourceSubscriptionAction::Subscribe => {
+            service.subscribe(SubscribeRequestParams::new(resource_uri.to_owned())).await
+        },
+        ResourceSubscriptionAction::Unsubscribe => {
+            service.unsubscribe(UnsubscribeRequestParams::new(resource_uri.to_owned())).await
+        },
     };
 
     response.map_err(|error| {
@@ -893,8 +944,11 @@ async fn forward_resource_subscription(
     Ok(())
 }
 
-fn split_tool_name<'a, N: AsRef<str>>(tool_name: &'a str, backend_names: &'a [N]) -> Option<BackendToolPair<'a>> {
-    split_prefixed_backend_name(tool_name, backend_names)
+fn split_tool_name<'a, T: AsRef<str> + ?Sized, N: AsRef<str>>(
+    tool_name: &'a T,
+    backend_names: &'a [N],
+) -> Option<BackendToolPair<'a>> {
+    split_backend_prefixed_name(tool_name, backend_names)
         .map(|(backend_name, tool_name)| BackendToolPair { backend_name, tool_name })
 }
 
@@ -959,28 +1013,26 @@ fn merge_resources(resources: Vec<(String, ListResourcesResult)>) -> Vec<Resourc
         .collect::<Vec<_>>()
 }
 
-fn split_resource_name<'a, N: AsRef<str>>(
-    resource_uri: &'a str,
+fn split_resource_name<'a, T: AsRef<str> + ?Sized, N: AsRef<str>>(
+    resource_uri: &'a T,
     backend_names: &'a [N],
 ) -> Option<BackendResourcePair<'a>> {
-    split_prefixed_backend_name(resource_uri, backend_names)
+    split_backend_prefixed_name(resource_uri, backend_names)
         .map(|(backend_name, resource_uri)| BackendResourcePair { backend_name, resource_uri })
 }
 
-fn split_prefixed_backend_name<'a, N: AsRef<str>>(
-    value: &'a str,
+fn split_backend_prefixed_name<'a, T: AsRef<str> + ?Sized, N: AsRef<str>>(
+    value: &'a T,
     backend_names: &'a [N],
 ) -> Option<(&'a str, &'a str)> {
+    let value = value.as_ref();
     backend_names
         .iter()
-        .filter_map(|backend_name| {
-            let backend_name = backend_name.as_ref();
-            value
-                .strip_prefix(backend_name)
-                .and_then(|suffix| suffix.strip_prefix('-'))
-                .map(|suffix| (backend_name, suffix))
+        .filter_map(|name| {
+            let name = name.as_ref();
+            value.strip_prefix(name).and_then(|suffix| suffix.strip_prefix('-')).map(|unprefixed| (name, unprefixed))
         })
-        .max_by_key(|(backend_name, _)| backend_name.len())
+        .max_by_key(|(name, _)| name.len())
 }
 
 #[cfg(test)]
@@ -995,28 +1047,31 @@ mod tests {
         let tool_name = "counter-one-increment";
         let backend_names = vec!["counter-on", "counter-oneee", "counter-one"];
         let pair = BackendToolPair { backend_name: "counter-one", tool_name: "increment" };
-        assert_eq!(Some(pair), split_tool_name(tool_name, &backend_names));
+        assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
         let tool_name = "counter-oneincrement";
-        assert_eq!(None, split_tool_name(tool_name, &backend_names));
+        assert_eq!(None, split_tool_name(&tool_name, &backend_names));
         let tool_name = "counteroneincrement";
-        assert_eq!(None, split_tool_name(tool_name, &backend_names));
+        assert_eq!(None, split_tool_name(&tool_name, &backend_names));
         let tool_name = "counter-one-get-value";
         let pair = BackendToolPair { backend_name: "counter-one", tool_name: "get-value" };
-        assert_eq!(Some(pair), split_tool_name(tool_name, &backend_names));
+        assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
 
         let backend_names = vec!["counter_on", "counter_oneee", "counter_one"];
         let tool_name = "counter_one-get-value";
         let pair = BackendToolPair { backend_name: "counter_one", tool_name: "get-value" };
-        assert_eq!(Some(pair), split_tool_name(tool_name, &backend_names));
+        assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
 
-        let backend_names = vec!["a", "a-b"];
-        let tool_name = "a-b-get-value";
-        let pair = BackendToolPair { backend_name: "a-b", tool_name: "get-value" };
-        assert_eq!(Some(pair), split_tool_name(tool_name, &backend_names));
+        let backend_names = vec!["counter", "counter-one"];
+        let tool_name = "counter-one-get-value";
+        let pair = BackendToolPair { backend_name: "counter-one", tool_name: "get-value" };
+        assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
 
-        let resource_uri = "a-b-memo://insights";
-        let pair = BackendResourcePair { backend_name: "a-b", resource_uri: "memo://insights" };
-        assert_eq!(Some(pair), split_resource_name(resource_uri, &backend_names));
+        let resource_uri = "counter-one-memo://insights";
+        let pair = BackendResourcePair { backend_name: "counter-one", resource_uri: "memo://insights" };
+        assert_eq!(Some(pair), split_resource_name(&resource_uri, &backend_names));
+
+        let resource_uri = "unknown-memo://insights";
+        assert_eq!(None, split_resource_name(&resource_uri, &backend_names));
     }
 
     #[test]
@@ -1062,5 +1117,38 @@ mod tests {
 
         assert!(!subscriptions.lock().await.contains_key(&session_key));
         assert!(!log_levels.lock().await.contains_key(&session_key));
+    }
+
+    #[tokio::test]
+    async fn session_manager_scopes_transports_by_full_session_key() {
+        let backend_name = "backend".to_owned();
+        let virtual_host = contextforge_gateway_rs_apis::user_store::VirtualHost {
+            backends: HashMap::from([(
+                backend_name.clone(),
+                contextforge_gateway_rs_apis::user_store::BackendMCPGateway {
+                    url: "http://127.0.0.1:1".parse().expect("test URL should parse"),
+                },
+            )]),
+        };
+        let session_key = SessionKey::new("subject", "virtual-host", "session");
+        let other_subject = SessionKey::new("other-subject", "virtual-host", "session");
+        let other_virtual_host = SessionKey::new("subject", "other-virtual-host", "session");
+        let (backend_notifications, _) = broadcast::channel(1);
+        let transports = Arc::new(Mutex::new(HashMap::from([(
+            BackendTransportKey::from((backend_name.as_str(), &session_key)),
+            BackendTransportService { capabilities: None, service: None, backend_notifications },
+        )])));
+
+        let session_manager = SessionManager::new(&virtual_host, &session_key, &transports);
+        assert_eq!(session_manager.borrow_transports().await.len(), 1);
+        assert!(session_manager.borrow_transport("backend").await.is_some());
+
+        let session_manager = SessionManager::new(&virtual_host, &other_subject, &transports);
+        assert!(session_manager.borrow_transports().await.is_empty());
+        assert!(session_manager.borrow_transport("backend").await.is_none());
+
+        let session_manager = SessionManager::new(&virtual_host, &other_virtual_host, &transports);
+        assert!(session_manager.borrow_transports().await.is_empty());
+        assert!(session_manager.borrow_transport("backend").await.is_none());
     }
 }

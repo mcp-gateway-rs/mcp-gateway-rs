@@ -31,6 +31,7 @@ use rmcp::{
     },
 };
 use rustls::crypto::{self};
+use serde_json::Value;
 use tracing::{info, warn};
 
 use contextforge_gateway_rs_lib::{
@@ -62,7 +63,7 @@ type CapturedNotifications = Arc<Mutex<Vec<CapturedNotification>>>;
 
 #[derive(Clone, Debug)]
 enum CapturedNotification {
-    Logging(String),
+    Logging(Value),
     Progress(ProgressNotificationParam),
     ResourceUpdated(String),
     ResourceListChanged,
@@ -89,7 +90,7 @@ impl ClientHandler for NotificationCapturingClient {
         self.notifications
             .lock()
             .expect("notification lock should not be poisoned")
-            .push(CapturedNotification::Logging(params.data.as_str().unwrap_or_default().to_owned()));
+            .push(CapturedNotification::Logging(params.data));
     }
 
     async fn on_resource_updated(
@@ -199,7 +200,7 @@ fn find_tool(expected_tool_names: &[String], suffix: &str) -> Result<String> {
         .ok_or_else(|| format!("Missing {suffix} tool").into())
 }
 
-fn find_tools(expected_tool_names: &[String], suffix: &str, count: usize) -> Result<Vec<String>> {
+fn find_first_tools(expected_tool_names: &[String], suffix: &str, count: usize) -> Result<Vec<String>> {
     let tools =
         expected_tool_names.iter().filter(|name| name.ends_with(suffix)).take(count).cloned().collect::<Vec<_>>();
     if tools.len() == count {
@@ -323,6 +324,8 @@ async fn create_gateway_with_four_counters(user: &str, config: Config) -> Result
     virtual_host_one_tool_names.sort();
     virtual_host_two_tool_names.sort();
 
+    let user_key = User::new(user);
+
     let virtual_host_one_id = uuid::Uuid::new_v4().to_string();
     let virtual_host_two_id = uuid::Uuid::new_v4().to_string();
 
@@ -333,7 +336,7 @@ async fn create_gateway_with_four_counters(user: &str, config: Config) -> Result
 
     let user_config = UserConfig { virtual_hosts };
 
-    mocked_user_config_store.set_config(&User::new(user), &user_config).await.expect("This should work");
+    mocked_user_config_store.set_config(&user_key, &user_config).await.expect("This should work");
 
     let gateway = Gateway::builder()
         .with_config(config.clone())
@@ -530,7 +533,7 @@ async fn plaintext_call_tool_forwards_backend_notifications() -> Result<()> {
         clear_notifications(&notifications);
 
         let progress_tool = find_tool(&expected_tool_names, "-progress_task")?;
-        let notification_tools = find_tools(&expected_tool_names, "-notification_task", 2)?;
+        let notification_tools = find_first_tools(&expected_tool_names, "-notification_task", 2)?;
         let notification_tool = notification_tools[0].clone();
         let second_notification_tool = notification_tools[1].clone();
         let backend_name = notification_tool.strip_suffix("-notification_task").expect("tool suffix should match");
@@ -644,6 +647,7 @@ async fn plaintext_call_tool_forwards_backend_notifications() -> Result<()> {
             return Err("Resource update should not be forwarded after unsubscribe".into());
         }
 
+        service.subscribe(SubscribeRequestParams::new(resource_uri.clone())).await?;
         let failing_uri = format!("{backend_name}-fail://subscribe");
         clear_notifications(&notifications);
         if service.subscribe(SubscribeRequestParams::new(failing_uri.clone())).await.is_ok() {
@@ -669,6 +673,40 @@ async fn plaintext_call_tool_forwards_backend_notifications() -> Result<()> {
         .await;
         if !saw_failed_subscribe_sentinel || saw_failed_subscribe_resource || !failed_subscribe_resource_stayed_absent {
             return Err("Failed subscribe should not forward buffered resource updates".into());
+        }
+
+        clear_notifications(&notifications);
+        service.call_tool(CallToolRequestParams::new(notification_tool.clone())).await?;
+        let original_subscription_still_forwards = eventually(Duration::from_secs(1), || {
+            notifications_contain(
+                &notifications,
+                |event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri),
+            )
+        })
+        .await;
+        if !original_subscription_still_forwards {
+            return Err("Failed same-backend subscribe should restore the original notification relay".into());
+        }
+
+        let failing_unsubscribe_uri = format!("{backend_name}-fail://unsubscribe");
+        clear_notifications(&notifications);
+        if service.unsubscribe(UnsubscribeRequestParams::new(failing_unsubscribe_uri.clone())).await.is_ok() {
+            return Err("Expected backend unsubscribe failure to propagate".into());
+        }
+        service.call_tool(CallToolRequestParams::new(notification_tool.clone())).await?;
+        let original_subscription_survived_failed_unsubscribe = eventually(Duration::from_secs(1), || {
+            notifications_contain(
+                &notifications,
+                |event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri),
+            )
+        })
+        .await;
+        let saw_failed_unsubscribe_resource = notifications_contain(
+            &notifications,
+            |event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri.starts_with(&failing_unsubscribe_uri)),
+        );
+        if !original_subscription_survived_failed_unsubscribe || saw_failed_unsubscribe_resource {
+            return Err("Failed unsubscribe should restore the original notification relay".into());
         }
 
         let instant_tool = format!("{backend_name}-instant_logging_task");

@@ -323,9 +323,19 @@ impl ServerHandler for Counter {
 
     async fn unsubscribe(
         &self,
-        _request: UnsubscribeRequestParams,
-        _: RequestContext<RoleServer>,
+        request: UnsubscribeRequestParams,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        if request.uri == "fail://unsubscribe" {
+            let _ = ctx
+                .peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new("fail://unsubscribe/private"))
+                .await;
+            return Err(McpError::internal_error("unsubscribe failed for test", None));
+        }
+        if request.uri == "memo://insights" {
+            let _ = ctx.peer.notify_resource_updated(ResourceUpdatedNotificationParam::new("memo://insights")).await;
+        }
         Ok(())
     }
 

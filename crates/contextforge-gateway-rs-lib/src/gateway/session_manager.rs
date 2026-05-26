@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use contextforge_gateway_rs_apis::user_store::VirtualHost;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, info};
 
 use super::{
     backend_notifications::BackendNotification,
@@ -42,6 +41,17 @@ impl<'a> SessionManager<'a> {
             .collect()
     }
 
+    // pub async fn return_transports(&self, backend_transports: impl Iterator<Item = ServiceHolder>) {
+    //     let backend_transports = backend_transports.collect::<Vec<_>>();
+    //     info!("Returning transports {:?} {backend_transports:?}", self.session_id);
+    //     let mut transports = self.transports.lock().await;
+    //     for svc_holder in backend_transports {
+    //         transports
+    //             .entry(BackendTransportKey::from((&svc_holder.name, self.session_id)))
+    //             .and_modify(|e| e.service = svc_holder.running_service);
+    //     }
+    // }
+
     pub(crate) async fn subscribe_backend_notifications(
         &self,
         backend_name: &str,
@@ -52,13 +62,14 @@ impl<'a> SessionManager<'a> {
             .map(|b| b.backend_notifications.subscribe())
     }
 
-    pub async fn cleanup_backends(&self, reason: &'static str) {
-        info!("Cleaning up backends {}", self.session_key);
-        let mut transports = self.transports.lock().await;
-        for name in self.virtual_host.backends.keys() {
-            let key = BackendTransportKey::from((name.as_str(), self.session_key));
-            debug!("session_manager: removing transport for {key:?} {reason}");
-            transports.remove(&key);
+    pub(crate) async fn borrow_transport(&self, backend_name: &str) -> Option<ServiceHolder> {
+        if !self.virtual_host.backends.contains_key(backend_name) {
+            return None;
         }
+
+        let transports = self.transports.lock().await;
+        transports
+            .get(&BackendTransportKey::from((backend_name, self.session_key)))
+            .map(|b| ServiceHolder::new(backend_name.to_owned(), b.service.clone()))
     }
 }

@@ -143,10 +143,12 @@ pub(crate) async fn await_call_tool_response_with_notifications(
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!(skipped, "backend notification receiver lagged");
                 },
-                Err(broadcast::error::RecvError::Closed) => return call_tool_result(response.await),
+                Err(broadcast::error::RecvError::Closed) => break,
             },
         }
     }
+
+    call_tool_result(response.await)
 }
 
 pub(crate) async fn relay_backend_notifications(mut relay: SessionNotificationRelay) {
@@ -178,7 +180,9 @@ pub(crate) async fn relay_backend_notifications(mut relay: SessionNotificationRe
     }
 }
 
-pub(crate) async fn drain_buffered_session_notifications(mut relay: SessionNotificationRelay) {
+pub(crate) async fn drain_buffered_session_notifications(
+    mut relay: SessionNotificationRelay,
+) -> Option<broadcast::Receiver<BackendNotification>> {
     let scope = RelayScope {
         backend_name: &relay.backend_name,
         resource_subscriptions: &relay.resource_subscriptions,
@@ -186,11 +190,13 @@ pub(crate) async fn drain_buffered_session_notifications(mut relay: SessionNotif
         session_key: &relay.session_key,
     };
 
-    for notification in collect_buffered_notifications(&mut relay.notification_rx) {
+    let mut drained = 0;
+    while let Some(notification) = next_buffered_notification(&mut relay.notification_rx, &mut drained) {
         if !forward_session_notification(&relay.downstream_peer, notification, &scope).await {
-            break;
+            return None;
         }
     }
+    Some(relay.notification_rx)
 }
 
 async fn drain_buffered_notifications(
@@ -198,39 +204,40 @@ async fn drain_buffered_notifications(
     downstream_peer: &Peer<RoleServer>,
     scope: &RequestScope<'_>,
 ) {
-    for notification in collect_buffered_notifications(notification_rx) {
+    let mut drained = 0;
+    while let Some(notification) = next_buffered_notification(notification_rx, &mut drained) {
         forward_request_notification(downstream_peer, notification, scope).await;
     }
 }
 
-fn collect_buffered_notifications(
+fn next_buffered_notification(
     notification_rx: &mut broadcast::Receiver<BackendNotification>,
-) -> Vec<BackendNotification> {
-    let mut notifications = Vec::with_capacity(MAX_BUFFERED_NOTIFICATIONS_AFTER_RESPONSE);
+    drained: &mut usize,
+) -> Option<BackendNotification> {
+    if *drained >= MAX_BUFFERED_NOTIFICATIONS_AFTER_RESPONSE {
+        debug!(drained, "stopped draining backend notifications after response");
+        return None;
+    }
+
     loop {
-        if notifications.len() >= MAX_BUFFERED_NOTIFICATIONS_AFTER_RESPONSE {
-            debug!(drained = notifications.len(), "stopped draining backend notifications after response");
-            break;
-        }
         match notification_rx.try_recv() {
-            Ok(notification) => notifications.push(notification),
+            Ok(notification) => {
+                *drained += 1;
+                return Some(notification);
+            },
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 debug!(skipped, "backend notification receiver lagged while draining");
             },
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => return None,
         }
     }
-    notifications
 }
 
 fn call_tool_result(response: Result<ServerResult, ServiceError>) -> Result<CallToolResult, ServiceError> {
-    response.and_then(|response| {
-        if let ServerResult::CallToolResult(result) = response {
-            Ok(result)
-        } else {
-            Err(ServiceError::UnexpectedResponse)
-        }
-    })
+    match response? {
+        ServerResult::CallToolResult(result) => Ok(result),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
 }
 
 async fn forward_request_notification(
@@ -295,15 +302,15 @@ async fn scope_session_notification(
             Some(BackendNotification::Logging(params))
         },
         BackendNotification::ResourceUpdated(mut params) => {
-            params.uri = format!("{}-{}", scope.backend_name, params.uri);
-            let is_subscribed =
-                scope.resource_subscriptions.lock().await.get(scope.session_key).is_some_and(|subscriptions| {
-                    subscriptions.contains(&params.uri)
-                        || subscriptions.iter().any(|subscribed| resource_uri_matches(subscribed, &params.uri))
-                });
+            let subscriptions = scope.resource_subscriptions.lock().await;
+            let session_subscriptions = subscriptions.get(scope.session_key)?;
+            let scoped_uri = format!("{}-{}", scope.backend_name, params.uri);
+            let is_subscribed = session_subscriptions.contains(&scoped_uri)
+                || session_subscriptions.iter().any(|subscribed| resource_uri_matches(subscribed, &scoped_uri));
             if !is_subscribed {
                 return None;
             }
+            params.uri = scoped_uri;
             Some(BackendNotification::ResourceUpdated(params))
         },
         BackendNotification::ResourceListChanged => Some(BackendNotification::ResourceListChanged),
@@ -448,6 +455,19 @@ mod tests {
         assert!(unsubscribed.is_none());
     }
 
+    #[tokio::test]
+    async fn scopes_resource_updated_by_session_key() {
+        let other_session_key = SessionKey::new("other-subject", "virtual-host", "session");
+        let subscriptions = resource_subscriptions(&other_session_key, &["backend-memo://insights"]);
+        let scoped = scope_session_for_test(
+            BackendNotification::ResourceUpdated(ResourceUpdatedNotificationParam { uri: "memo://insights".into() }),
+            &subscriptions,
+        )
+        .await;
+
+        assert!(scoped.is_none());
+    }
+
     #[test]
     fn drain_collects_only_configured_buffer() {
         let (tx, mut rx) = broadcast::channel(MAX_BUFFERED_NOTIFICATIONS_AFTER_RESPONSE * 2);
@@ -460,7 +480,11 @@ mod tests {
             .expect("receiver should accept test notification");
         }
 
-        let buffered = collect_buffered_notifications(&mut rx);
+        let mut drained = 0;
+        let mut buffered = Vec::new();
+        while let Some(notification) = next_buffered_notification(&mut rx, &mut drained) {
+            buffered.push(notification);
+        }
 
         assert_eq!(buffered.len(), MAX_BUFFERED_NOTIFICATIONS_AFTER_RESPONSE);
         assert!(matches!(rx.try_recv(), Ok(BackendNotification::Logging(_))));

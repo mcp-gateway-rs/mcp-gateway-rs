@@ -1,5 +1,6 @@
 use contextforge_gateway_rs_apis::user_store::{UserConfig, VirtualHost};
 use http::request::Parts;
+//use rmcp::{ErrorData, RoleServer, model::ErrorCode, service::RequestContext, transport::DownstreamSessionId};
 use rmcp::{
     ErrorData, RoleServer, model::ErrorCode, service::RequestContext,
     transport::streamable_http_server::tower::DownstreamSessionId,
@@ -74,7 +75,13 @@ impl<'a> AuthorizedCallValidator<'a> {
         let maybe_claims = maybe_parts.and_then(|parts| parts.extensions.get::<ContextForgeClaims>());
 
         let maybe_virtual_host_id = maybe_parts.and_then(|parts| parts.extensions.get::<VirtualHostId>());
-        info!("{} request context loaded", self.call_name);
+        info!(
+            "{} context user_config={} session_id={} virtual_host_id={}",
+            self.call_name,
+            maybe_user_config.is_some(),
+            maybe_session_id.is_some(),
+            maybe_virtual_host_id.is_some()
+        );
 
         let Some(session_id) = maybe_session_id else {
             return Err(ErrorData {
@@ -138,7 +145,12 @@ impl<'a> InitializeCallValidator<'a> {
         let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
         let maybe_virtual_host_id = maybe_parts.and_then(|parts| parts.extensions.get::<VirtualHostId>());
         let maybe_claims = maybe_parts.and_then(|parts| parts.extensions.get::<ContextForgeClaims>());
-        info!("initialize request context loaded");
+        info!(
+            "initialize context user_config={} downstream_session_id={} virtual_host_id={}",
+            maybe_user_config.is_some(),
+            maybe_downstream_session.is_some(),
+            maybe_virtual_host_id.is_some()
+        );
 
         let Some(downstream_session_id) = maybe_downstream_session else {
             return Err(ErrorData {
