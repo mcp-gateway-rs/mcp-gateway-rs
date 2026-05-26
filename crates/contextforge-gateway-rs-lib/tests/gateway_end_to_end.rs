@@ -1,6 +1,13 @@
 mod support;
 
-use std::{collections::HashMap, fs::File, io::Read, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use contextforge_gateway_rs_apis::{
     User,
@@ -9,8 +16,14 @@ use contextforge_gateway_rs_apis::{
 use futures::{FutureExt, future::BoxFuture};
 use http::{HeaderMap, HeaderValue};
 use rmcp::{
-    ServiceExt,
+    ClientHandler, ServiceExt,
     model::InitializeRequestParams,
+    model::{
+        CallToolRequest, CallToolRequestParams, CallToolResult, ClientInfo, ClientRequest, LoggingLevel,
+        LoggingMessageNotificationParam, ProgressNotificationParam, ResourceUpdatedNotificationParam, ServerResult,
+        SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
+    },
+    service::{NotificationContext, PeerRequestOptions, RoleClient, RunningService},
     transport::{
         StreamableHttpClientTransport, StreamableHttpServerConfig, StreamableHttpService,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -25,8 +38,158 @@ use contextforge_gateway_rs_lib::{
 };
 use support::{MemoryUserConfigStore, mock_counter, token};
 
-const MOCK_COUNTER_TOOL_NAMES: &[&str] =
-    &["decrement", "echo", "get_session_id", "get_value", "increment", "long_task", "say_hello", "sum"];
+const MOCK_COUNTER_TOOL_NAMES: &[&str] = &[
+    "decrement",
+    "echo",
+    "get_session_id",
+    "get_value",
+    "increment",
+    "instant_logging_task",
+    "logging_task",
+    "long_task",
+    "notification_task",
+    "progress_task",
+    "say_hello",
+    "sum",
+];
+
+#[derive(Clone, Debug)]
+struct NotificationCapturingClient {
+    notifications: Arc<Mutex<Vec<CapturedNotification>>>,
+}
+
+#[derive(Clone, Debug)]
+enum CapturedNotification {
+    Logging(String),
+    Progress(ProgressNotificationParam),
+    ResourceUpdated(String),
+    ResourceListChanged,
+    ToolListChanged,
+}
+
+impl ClientHandler for NotificationCapturingClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+
+    async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
+        self.notifications
+            .lock()
+            .expect("notification lock should not be poisoned")
+            .push(CapturedNotification::Progress(params));
+    }
+
+    async fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.notifications
+            .lock()
+            .expect("notification lock should not be poisoned")
+            .push(CapturedNotification::Logging(params.data.as_str().unwrap_or_default().to_owned()));
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.notifications
+            .lock()
+            .expect("notification lock should not be poisoned")
+            .push(CapturedNotification::ResourceUpdated(params.uri));
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.notifications
+            .lock()
+            .expect("notification lock should not be poisoned")
+            .push(CapturedNotification::ResourceListChanged);
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.notifications
+            .lock()
+            .expect("notification lock should not be poisoned")
+            .push(CapturedNotification::ToolListChanged);
+    }
+}
+
+async fn notification_client(
+    gateway_url: String,
+    client: reqwest::Client,
+) -> Result<(RunningService<RoleClient, NotificationCapturingClient>, Arc<Mutex<Vec<CapturedNotification>>>)> {
+    let notifications = Arc::new(Mutex::new(Vec::new()));
+    let service = NotificationCapturingClient { notifications: Arc::clone(&notifications) }
+        .serve(StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(gateway_url),
+        ))
+        .await?;
+    Ok((service, notifications))
+}
+
+async fn eventually<F>(timeout: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn remains_true_for<F>(duration: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + duration;
+    loop {
+        if !condition() {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn find_tool(expected_tool_names: &[String], suffix: &str) -> Result<String> {
+    expected_tool_names
+        .iter()
+        .find(|name| name.ends_with(suffix))
+        .cloned()
+        .ok_or_else(|| format!("Missing {suffix} tool").into())
+}
+
+fn find_tools(expected_tool_names: &[String], suffix: &str, count: usize) -> Result<Vec<String>> {
+    let tools =
+        expected_tool_names.iter().filter(|name| name.ends_with(suffix)).take(count).cloned().collect::<Vec<_>>();
+    if tools.len() == count {
+        Ok(tools)
+    } else {
+        Err(format!("Expected {count} {suffix} tools, got {}", tools.len()).into())
+    }
+}
+
+fn call_tool_result_contains_text(result: &CallToolResult, expected: &str) -> bool {
+    result.content.iter().any(|content| content.as_text().is_some_and(|text| text.text == expected))
+}
+
+fn server_result_contains_text(result: &ServerResult, expected: &str) -> bool {
+    match result {
+        ServerResult::CallToolResult(result) => call_tool_result_contains_text(result, expected),
+        _ => false,
+    }
+}
 
 fn create_ports(ports: usize) -> Vec<u16> {
     (0..ports).map(|_| openport::pick_random_unused_port().expect("Expecting to find port")).collect()
@@ -50,9 +213,7 @@ fn create_backends(ports: &[u16], with_tls: bool) -> HashMap<String, BackendMCPG
 fn create_tool_names(ports: &[u16]) -> Vec<String> {
     ports
         .iter()
-        .flat_map(|port| {
-            MOCK_COUNTER_TOOL_NAMES.iter().map(|name| format!("backend-{port}-{name}")).collect::<Vec<_>>()
-        })
+        .flat_map(|port| MOCK_COUNTER_TOOL_NAMES.iter().map(move |name| format!("backend-{port}-{name}")))
         .collect::<Vec<_>>()
 }
 
@@ -308,6 +469,213 @@ async fn plaintext_list_tools_end_to_end_test() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[test_log::test]
+async fn plaintext_call_tool_forwards_backend_notifications() -> Result<()> {
+    let gateway_port = create_ports(1)[0];
+
+    let config = Config {
+        address: Some(format!("127.0.0.1:{gateway_port}").parse().expect("This should work")),
+        token_verification_public_key: Some("../../assets/jwt.key.pub".into()),
+        upstream_connection_mode: Some(UpstreamConnectionMode::PlainTextOrTls),
+        ..Default::default()
+    };
+
+    let user = "admin@example.com";
+    let TestSettings { handle, gateway_url, expected_tool_names } =
+        create_gateway_with_four_counters(user, config).await.expect("valid plaintext gateway configuration");
+
+    let test_future: BoxFuture<'_, Result<()>> = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut default_headers = HeaderMap::new();
+        let token = token(user);
+        default_headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).expect("This should work"),
+        );
+        let client = reqwest::Client::builder().default_headers(default_headers).build().expect("This should work");
+
+        let (service, notifications) = notification_client(gateway_url.clone(), client.clone()).await?;
+        let saw_initialized_tool_list = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications.iter().any(|event| matches!(event, CapturedNotification::ToolListChanged))
+        })
+        .await;
+        if !saw_initialized_tool_list {
+            return Err("Expected backend tool list notification after initialize".into());
+        }
+        notifications.lock().expect("notification lock should not be poisoned").clear();
+
+        let progress_tool = find_tool(&expected_tool_names, "-progress_task")?;
+        let notification_tools = find_tools(&expected_tool_names, "-notification_task", 2)?;
+        let notification_tool = notification_tools[0].clone();
+        let second_notification_tool = notification_tools[1].clone();
+        let backend_name = notification_tool.strip_suffix("-notification_task").expect("tool suffix should match");
+        let second_backend_name =
+            second_notification_tool.strip_suffix("-notification_task").expect("tool suffix should match");
+        let logging_tool = format!("{backend_name}-logging_task");
+        let resource_uri = format!("{backend_name}-memo://insights");
+        let second_resource_uri = format!("{second_backend_name}-memo://insights");
+
+        let long_tool = find_tool(&expected_tool_names, "-long_task")?;
+        let long_request = ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(long_tool)));
+        let long_handle = service.send_cancellable_request(long_request, PeerRequestOptions::no_options()).await?;
+        let list_tools_while_call_is_active = service.list_tools(None).await?;
+        let mut names =
+            list_tools_while_call_is_active.tools.iter().map(|tool| tool.name.to_string()).collect::<Vec<_>>();
+        names.sort();
+        long_handle.cancel(Some("concurrency check complete".to_owned())).await?;
+        if names != expected_tool_names {
+            return Err("Concurrent same-session list_tools returned partial backend data".into());
+        }
+
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(progress_tool)));
+        let request_handle = service.send_cancellable_request(request, PeerRequestOptions::no_options()).await?;
+        let expected_progress_token = request_handle.progress_token.clone();
+        let saw_progress = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications.iter().any(|event| {
+                matches!(
+                    event,
+                    CapturedNotification::Progress(params)
+                        if params.message.as_deref() == Some("progress from backend")
+                            && params.progress_token == expected_progress_token
+                )
+            })
+        })
+        .await;
+        let result = request_handle.await_response().await?;
+        if !saw_progress || !server_result_contains_text(&result, "Progress task completed") {
+            return Err(format!("Unexpected progress forwarding result {result:?} {:?}", notifications.lock()).into());
+        }
+
+        service.subscribe(SubscribeRequestParams::new(resource_uri.clone())).await?;
+        let saw_async_resource_update = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri))
+                && notifications.iter().any(|event| matches!(event, CapturedNotification::ResourceListChanged))
+                && notifications.iter().any(|event| matches!(event, CapturedNotification::ToolListChanged))
+        })
+        .await;
+        if !saw_async_resource_update {
+            return Err(format!("Expected async subscribed notifications, got {:?}", notifications.lock()).into());
+        }
+
+        notifications.lock().expect("notification lock should not be poisoned").clear();
+        let result = service.call_tool(CallToolRequestParams::new(notification_tool.clone())).await?;
+        let saw_resource_update = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri))
+        })
+        .await;
+        if !saw_resource_update || !call_tool_result_contains_text(&result, "Notification task completed") {
+            return Err(format!("Unexpected resource notification result {result:?} {:?}", notifications.lock()).into());
+        }
+
+        notifications.lock().expect("notification lock should not be poisoned").clear();
+        service.subscribe(SubscribeRequestParams::new(second_resource_uri.clone())).await?;
+        let saw_second_backend_resource_update = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &second_resource_uri))
+        })
+        .await;
+        if !saw_second_backend_resource_update {
+            return Err("Expected notification from second backend subscription".into());
+        }
+
+        notifications.lock().expect("notification lock should not be poisoned").clear();
+        service.unsubscribe(UnsubscribeRequestParams::new(resource_uri.clone())).await?;
+        service.call_tool(CallToolRequestParams::new(notification_tool.clone())).await?;
+        let no_update_after_unsubscribe = remains_true_for(Duration::from_millis(100), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            !notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri))
+        })
+        .await;
+        if !no_update_after_unsubscribe {
+            return Err("Resource update should not be forwarded after unsubscribe".into());
+        }
+
+        let failing_uri = format!("{backend_name}-fail://subscribe");
+        notifications.lock().expect("notification lock should not be poisoned").clear();
+        if service.subscribe(SubscribeRequestParams::new(failing_uri.clone())).await.is_ok() {
+            return Err("Expected backend subscribe failure to propagate".into());
+        }
+        let failed_subscribe_stayed_quiet = remains_true_for(Duration::from_millis(100), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            !notifications.iter().any(
+                |event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri.starts_with(&failing_uri)),
+            )
+        })
+        .await;
+        if !failed_subscribe_stayed_quiet {
+            return Err("Failed subscribe should not forward buffered resource updates".into());
+        }
+
+        let instant_tool = format!("{backend_name}-instant_logging_task");
+        let result = service.call_tool(CallToolRequestParams::new(instant_tool)).await?;
+        let saw_instant_log = eventually(Duration::from_secs(1), || {
+            let notifications = notifications.lock().expect("notification lock should not be poisoned");
+            notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::Logging(message) if message == "Instant log"))
+        })
+        .await;
+        if !saw_instant_log || !call_tool_result_contains_text(&result, "Instant logging task completed") {
+            return Err(format!("Expected drained log notification, got {:?}", notifications.lock()).into());
+        }
+
+        let (muted_service, muted_notifications) = notification_client(gateway_url.clone(), client.clone()).await?;
+        muted_service.set_level(SetLevelRequestParams::new(LoggingLevel::Error)).await?;
+        let (default_service, default_notifications) = notification_client(gateway_url.clone(), client.clone()).await?;
+        let (unsubscribed_service, unsubscribed_notifications) = notification_client(gateway_url, client).await?;
+        muted_service.call_tool(CallToolRequestParams::new(logging_tool.clone())).await?;
+        default_service.call_tool(CallToolRequestParams::new(logging_tool)).await?;
+        unsubscribed_service.call_tool(CallToolRequestParams::new(notification_tool)).await?;
+        let muted_stayed_quiet = remains_true_for(Duration::from_millis(100), || {
+            let notifications = muted_notifications.lock().expect("notification lock should not be poisoned");
+            !notifications.iter().any(|event| matches!(event, CapturedNotification::Logging(_)))
+        })
+        .await;
+        let default_received_logs = eventually(Duration::from_secs(1), || {
+            let notifications = default_notifications.lock().expect("notification lock should not be poisoned");
+            notifications.iter().filter(|event| matches!(event, CapturedNotification::Logging(_))).count() == 3
+        })
+        .await;
+        if !muted_stayed_quiet || !default_received_logs {
+            return Err("Logging level should be scoped to the muted downstream session".into());
+        }
+        let unsubscribed_received_no_resource_update = remains_true_for(Duration::from_millis(250), || {
+            let notifications = unsubscribed_notifications.lock().expect("notification lock should not be poisoned");
+            !notifications
+                .iter()
+                .any(|event| matches!(event, CapturedNotification::ResourceUpdated(uri) if uri == &resource_uri))
+        })
+        .await;
+        if !unsubscribed_received_no_resource_update {
+            return Err("Resource subscriptions should be scoped to one downstream session".into());
+        }
+
+        service.cancel().await?;
+        muted_service.cancel().await?;
+        default_service.cancel().await?;
+        unsubscribed_service.cancel().await?;
+        Ok(())
+    }
+    .boxed();
+
+    let maybe_passed = test_future.await;
+    handle.abort();
+    maybe_passed
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

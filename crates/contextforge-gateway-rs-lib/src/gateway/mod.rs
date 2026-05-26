@@ -1,3 +1,4 @@
+mod backend_notifications;
 mod mcp_call_validator;
 pub(crate) mod mcp_gateway;
 mod session_manager;
