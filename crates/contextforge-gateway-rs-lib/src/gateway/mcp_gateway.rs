@@ -1,39 +1,57 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
-use contextforge_gateway_rs_apis::user_store::UserConfig;
-use contextforge_gateway_rs_cpex::{GatewayPluginRuntimeHandle, ToolPreCallResult};
-use http::request::Parts;
-use itertools::Itertools;
+use contextforge_gateway_rs_cpex::GatewayPluginRuntimeHandle;
 use rmcp::{
-    ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt,
-    model::{
-        AnnotateAble, CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo,
-        ErrorCode, GetPromptRequestParams, GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, LoggingLevel,
-        PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
-        RawImageContent, RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Reference, Resource,
-        ServerCapabilities, SetLevelRequestParams, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
-    },
-    service::{RequestContext, RunningService},
-    transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
+    ErrorData, RoleServer,
+    model::{ProgressToken, ServerCapabilities},
+    service::Peer,
 };
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use typed_builder::TypedBuilder;
 
-use super::mcp_call_validator::AuthorizedCallValidator;
-pub use crate::gateway::session_store::LocalUserSessionStore;
-use crate::{
-    SessionId,
-    gateway::{
-        mcp_call_validator::InitializeCallValidator,
-        session_manager::SessionManager,
-        session_store::{UserSession, UserSessionStore},
+use super::{
+    backend_notifications::{
+        BackendClientService, BackendNotification, LogLevels, ProgressTokens, ResourceSubscriptions,
+        SessionNotificationRelay, SessionRelayExit, drain_buffered_session_notifications, relay_backend_notifications,
     },
+    mcp_call_validator::SessionKey,
 };
+pub use crate::gateway::session_store::LocalUserSessionStore;
+use crate::gateway::{
+    session_manager::SessionManager,
+    session_store::{SessionStoreError, UserSession, UserSessionStore},
+};
+
+mod lifecycle;
+
+mod handlers;
+mod routing;
+
+use routing::{ResourceSubscriptionAction, forward_resource_subscription, remove_resource_subscription};
+
+pub(crate) use lifecycle::cleanup_registered_session_or_owner;
+use lifecycle::{
+    cleanup_finished_notification_relay, cleanup_notification_state, cleanup_pending_initialized_session,
+    discard_buffered_notifications,
+};
+
+const BACKEND_NOTIFICATION_BUFFER_CAPACITY: usize = 64;
+const MAX_BUFFERED_NOTIFICATIONS_AFTER_RELAY_STOP: usize = 16;
+#[cfg(not(test))]
+const UPSTREAM_NOTIFICATION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const UPSTREAM_NOTIFICATION_CONTROL_TIMEOUT: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const PENDING_INITIALIZED_RELAY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PENDING_INITIALIZED_RELAY_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Clone, TypedBuilder)]
 #[builder(field_defaults(setter(prefix = "with_")))]
@@ -41,12 +59,28 @@ pub struct McpService<T>
 where
     T: UserSessionStore,
 {
-    #[builder(default = Arc::new(Mutex::new(HashSet::new())))]
-    subscriptions: Arc<Mutex<HashSet<String>>>,
-    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
+    #[builder(default = Arc::new(RwLock::new(HashMap::new())), setter(skip))]
+    subscriptions: ResourceSubscriptions,
+    #[builder(default = Arc::new(RwLock::new(HashMap::new())), setter(skip))]
+    log_levels: LogLevels,
+    #[builder(default = Arc::new(RwLock::new(HashMap::new())), setter(skip))]
+    progress_tokens: ProgressTokens,
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())), setter(skip))]
     transports: Arc<Mutex<HashMap<BackendTransportKey, BackendTransportService>>>,
-    #[builder(default = Arc::new(Mutex::new(LoggingLevel::Debug)))]
-    log_level: Arc<Mutex<LoggingLevel>>,
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())), setter(skip))]
+    transport_session_keys: TransportSessionKeys,
+    #[builder(default = Arc::new(Mutex::new(NotificationRelayState::default())), setter(skip))]
+    notification_relay_state: Arc<Mutex<NotificationRelayState>>,
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())), setter(skip))]
+    pending_notification_relays: PendingNotificationRelays,
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())), setter(skip))]
+    subscription_change_locks: SubscriptionChangeLocks,
+    #[builder(default = Arc::new(Mutex::new(HashMap::new())))]
+    session_cleanup_registry: SessionCleanupRegistry,
+    #[builder(default = Arc::new(AtomicU64::new(1)), setter(skip))]
+    notification_relay_generation: Arc<AtomicU64>,
+    #[builder(default = UPSTREAM_NOTIFICATION_CONTROL_TIMEOUT)]
+    upstream_notification_control_timeout: Duration,
     http_client: reqwest::Client,
     user_session_store: T,
     #[builder(default)]
@@ -56,19 +90,17 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BackendTransportKey {
     backend_name: String,
-    session_id: String,
+    session_key: SessionKey,
 }
-
-type McpClientService = Arc<RunningService<RoleClient, InitializeRequestParams>>;
 
 #[derive(Debug)]
 pub struct ServiceHolder {
     pub name: String,
-    pub running_service: Option<McpClientService>,
+    pub running_service: Option<BackendClientService>,
 }
 
 impl ServiceHolder {
-    pub fn new(name: String, running_service: Option<McpClientService>) -> ServiceHolder {
+    pub fn new(name: String, running_service: Option<BackendClientService>) -> ServiceHolder {
         Self { name, running_service }
     }
 }
@@ -77,689 +109,508 @@ impl ServiceHolder {
 pub struct BackendTransportService {
     #[expect(dead_code, reason = "stored backend capabilities are kept with transport state for future routing")]
     capabilities: Option<ServerCapabilities>,
-    pub(crate) service: Option<McpClientService>,
+    pub(crate) service: Option<BackendClientService>,
+    pub(crate) backend_notifications: broadcast::Sender<BackendNotification>,
 }
 
-impl From<(&str, &str)> for BackendTransportKey {
-    fn from((backend_name, session_name): (&str, &str)) -> Self {
-        Self { backend_name: backend_name.to_owned(), session_id: session_name.to_owned() }
+#[derive(Debug)]
+struct NotificationRelayHandle {
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Default)]
+struct NotificationRelayState {
+    relays: HashMap<BackendTransportKey, NotificationRelayHandle>,
+}
+
+struct PendingNotificationRelay {
+    backend_name: String,
+    notification_rx: broadcast::Receiver<BackendNotification>,
+    downstream_peer: Peer<RoleServer>,
+}
+
+struct PendingNotificationRelaysForSession {
+    relays: Vec<PendingNotificationRelay>,
+    cleanup_handle: tokio::task::JoinHandle<()>,
+}
+
+type SubscriptionChangeLocks = Arc<Mutex<HashMap<BackendTransportKey, Arc<Mutex<()>>>>>;
+type TransportSessionKeys = Arc<Mutex<HashMap<SessionKey, HashSet<BackendTransportKey>>>>;
+type PendingNotificationRelays = Arc<Mutex<HashMap<SessionKey, PendingNotificationRelaysForSession>>>;
+pub(crate) type SessionCleanupRegistry = Arc<Mutex<HashMap<UserSession, SessionCleanupHandle>>>;
+
+#[derive(Clone)]
+pub(crate) struct SessionCleanupHandle {
+    session_key: SessionKey,
+    subscriptions: ResourceSubscriptions,
+    log_levels: LogLevels,
+    progress_tokens: ProgressTokens,
+    transports: Arc<Mutex<HashMap<BackendTransportKey, BackendTransportService>>>,
+    transport_session_keys: TransportSessionKeys,
+    notification_relay_state: Arc<Mutex<NotificationRelayState>>,
+    pending_notification_relays: PendingNotificationRelays,
+    subscription_change_locks: SubscriptionChangeLocks,
+    user_session_store: Arc<dyn UserSessionStore>,
+}
+
+struct NotificationRelayCleanup<'a> {
+    subscriptions: &'a ResourceSubscriptions,
+    log_levels: &'a LogLevels,
+    progress_tokens: &'a ProgressTokens,
+    transports: &'a Arc<Mutex<HashMap<BackendTransportKey, BackendTransportService>>>,
+    transport_session_keys: &'a TransportSessionKeys,
+    notification_relay_state: &'a Arc<Mutex<NotificationRelayState>>,
+    session_cleanup_registry: &'a SessionCleanupRegistry,
+    subscription_change_locks: &'a SubscriptionChangeLocks,
+    user_session_store: &'a dyn UserSessionStore,
+}
+
+struct PendingInitializedCleanup<'a> {
+    transports: &'a Arc<Mutex<HashMap<BackendTransportKey, BackendTransportService>>>,
+    transport_session_keys: &'a TransportSessionKeys,
+    session_cleanup_registry: &'a SessionCleanupRegistry,
+    subscription_change_locks: &'a SubscriptionChangeLocks,
+    user_session_store: &'a dyn UserSessionStore,
+    session_key: &'a SessionKey,
+}
+
+struct NotificationRelayResume<'a, 'b> {
+    session_manager: &'a SessionManager<'b>,
+    notification_rx: Option<broadcast::Receiver<BackendNotification>>,
+    backend_name: String,
+    session_key: SessionKey,
+    downstream_peer: Peer<RoleServer>,
+}
+
+struct BufferedNotificationRelay {
+    notification_rx: broadcast::Receiver<BackendNotification>,
+    key: BackendTransportKey,
+    backend_name: String,
+    session_key: SessionKey,
+    downstream_peer: Peer<RoleServer>,
+}
+
+struct ResourceSubscriptionChange<'a, 'b> {
+    session_manager: &'a SessionManager<'b>,
+    backend_name: String,
+    backend_resource_uri: String,
+    public_resource_uri: String,
+    session_key: SessionKey,
+    downstream_peer: Peer<RoleServer>,
+    action: ResourceSubscriptionAction,
+    timeout: Duration,
+}
+
+impl From<(&str, &SessionKey)> for BackendTransportKey {
+    fn from((backend_name, session_key): (&str, &SessionKey)) -> Self {
+        Self { backend_name: backend_name.to_owned(), session_key: session_key.clone() }
     }
 }
 
-impl From<(&String, &SessionId)> for BackendTransportKey {
-    fn from((backend_name, session_name): (&String, &SessionId)) -> Self {
-        Self { backend_name: backend_name.to_owned(), session_id: session_name.value().to_owned() }
-    }
-}
-
-impl From<(Option<ServerCapabilities>, Option<McpClientService>)> for BackendTransportService {
-    fn from((capabilities, service): (Option<ServerCapabilities>, Option<McpClientService>)) -> Self {
-        Self { capabilities, service }
-    }
-}
-
-impl<T> ServerHandler for McpService<T>
+impl<T> McpService<T>
 where
-    T: UserSessionStore + Send + Sync + 'static,
+    T: UserSessionStore + Clone + 'static,
 {
-    async fn initialize(
+    async fn activate_session_relays(&self, session_key: &SessionKey) {
+        self.start_pending_notification_relays(session_key).await;
+    }
+
+    async fn track_progress_token(
         &self,
-        request: InitializeRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<InitializeResult, ErrorData> {
-        let call_validator = InitializeCallValidator::new(&cx);
-        let (virtual_host, downstream_session_id) = call_validator.validate()?;
-        let session_mapping = if let Ok(maybe_session_mapping) = self
-            .user_session_store
-            .get_session(&UserSession::new(String::new(), Arc::clone(&downstream_session_id.session_id)))
-            .await
-        {
-            maybe_session_mapping.unwrap_or_default()
-        } else {
-            return Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Internal problem... session store can't be accessed".into(),
-                data: None,
-            });
-        };
+        session_key: &SessionKey,
+        backend_name: &str,
+        downstream_token: ProgressToken,
+    ) {
+        let mut progress_tokens = self.progress_tokens.write().await;
+        progress_tokens
+            .entry(session_key.clone())
+            .or_default()
+            .entry(backend_name.to_owned())
+            .or_default()
+            .insert(downstream_token);
+    }
 
-        let tasks: Vec<_> = virtual_host
-            .backends
-            .iter()
-            .map(|(name, backend)| {
-                let client = self.http_client.clone();
-                let request = request.clone();
-                let backend_url = backend.url.clone();
-                let downstream_session_id = downstream_session_id.clone();
+    async fn apply_resource_subscription_change(
+        &self,
+        change: ResourceSubscriptionChange<'_, '_>,
+    ) -> Result<(), ErrorData> {
+        let key = BackendTransportKey::from((change.backend_name.as_str(), &change.session_key));
+        let change_lock = self.subscription_change_lock(&key).await;
+        let _change_guard = change_lock.lock().await;
+        let mut buffered_notifications =
+            change.session_manager.subscribe_backend_notifications(&change.backend_name).await;
+        self.stop_notification_relay(&change.backend_name, &change.session_key).await;
+        if let Some(notification_rx) = buffered_notifications.as_mut() {
+            discard_buffered_notifications(notification_rx);
+        }
 
-                    Box::pin(async move {
-                        let mut headers = HashMap::new();
-                        if let Some(host) = backend_url.host_str() && backend_url.scheme() == "https"{
-                            let host = if let Some(port) = backend_url.port(){
-                                format!("{host}:{port}")
-                            }else{
-                                host.to_owned()
-                            };
+        let result = forward_resource_subscription(
+            change.session_manager,
+            &change.backend_name,
+            &change.backend_resource_uri,
+            change.action,
+            change.timeout,
+        )
+        .await;
 
-                            if let Ok(value) = http::HeaderValue::from_str(&host){
-                                headers.insert(http::header::HOST, value);
-                            }else{
-                                warn!("Really can't set the host header for {:?}",backend_url.host_str());
-                            }
-                        }
-
-                        let config = StreamableHttpClientTransportConfig::with_uri(backend_url.to_string())
-                            .custom_headers(headers);
-                        let transport = StreamableHttpClientTransport::with_client(client, config);
-                        let maybe_running_service = request.serve(transport).await;
-                        if let Ok(running_service) = maybe_running_service {
-                            info!("initialize: intialized for {downstream_session_id:?} {name:?}");
-                            (name, Some(running_service))
-                        } else {
-                            warn!("initialize: Unable to initialize for {downstream_session_id:?} {name:?} {maybe_running_service:?}",);
-                            (name, None)
-                        }
-                    })
-            }).collect();
-
-        let initialization_results: Vec<(&String, Option<RunningService<RoleClient, InitializeRequestParams>>)> =
-            futures::future::join_all(tasks).await;
-
-        let (capabilities, backend_services): (Vec<_>, Vec<_>) = initialization_results
-            .into_iter()
-            .map(|(name, running_service):(_,_)| {
-                info!("initialize: Adding transport: session_id {downstream_session_id:#?} backend {name} {running_service:?}");
-
-                let server_capabilities =
-                    running_service.as_ref()
-                        .and_then(|rs|
-                            rs.peer()
-                                .peer_info()
-                                .as_ref()
-                                .map(|pi| pi.capabilities.clone()));
-                (
-                    (name.clone(), server_capabilities.clone()),
-                    (name.clone(), BackendTransportService::from((server_capabilities, running_service.map(Arc::new)))),
+        match (change.action, &result) {
+            (ResourceSubscriptionAction::Subscribe, Ok(())) => {
+                self.subscriptions
+                    .write()
+                    .await
+                    .entry(change.session_key.clone())
+                    .or_default()
+                    .entry(change.backend_name.clone())
+                    .or_default()
+                    .insert(change.public_resource_uri);
+            },
+            (ResourceSubscriptionAction::Unsubscribe, Ok(())) => {
+                remove_resource_subscription(
+                    &self.subscriptions,
+                    &change.session_key,
+                    &change.backend_name,
+                    &change.public_resource_uri,
                 )
-            })
-            .unzip();
+                .await;
+            },
+            _ => {},
+        }
 
-        let _ = self
-            .user_session_store
-            .set_session(
-                &UserSession::new(String::new(), Arc::clone(&downstream_session_id.session_id)),
-                &session_mapping,
+        self.resume_notification_relay(NotificationRelayResume {
+            session_manager: change.session_manager,
+            notification_rx: buffered_notifications,
+            backend_name: change.backend_name,
+            session_key: change.session_key,
+            downstream_peer: change.downstream_peer,
+        })
+        .await;
+        result
+    }
+
+    async fn ensure_notification_relay(
+        &self,
+        session_manager: &SessionManager<'_>,
+        backend_name: &str,
+        session_key: &SessionKey,
+        downstream_peer: Peer<RoleServer>,
+    ) {
+        let key = BackendTransportKey::from((backend_name, session_key));
+        if self.notification_relay_is_active(&key).await || self.subscription_change_in_progress(&key).await {
+            return;
+        }
+        self.start_pending_notification_relays(session_key).await;
+        if self.notification_relay_is_active(&key).await {
+            return;
+        }
+        let Some(notification_rx) = session_manager.subscribe_backend_notifications(backend_name).await else {
+            return;
+        };
+        self.spawn_notification_relay(notification_rx, backend_name.to_owned(), session_key.clone(), downstream_peer)
+            .await;
+    }
+
+    async fn store_pending_notification_relays(
+        &self,
+        relay_receivers: Vec<(String, broadcast::Receiver<BackendNotification>)>,
+        session_key: &SessionKey,
+        downstream_peer: Peer<RoleServer>,
+    ) {
+        if relay_receivers.is_empty() {
+            return;
+        }
+        let pending_relays = relay_receivers
+            .into_iter()
+            .map(|(backend_name, notification_rx)| PendingNotificationRelay {
+                backend_name,
+                notification_rx,
+                downstream_peer: downstream_peer.clone(),
+            })
+            .collect();
+        let cleanup_handle = self.spawn_pending_initialized_cleanup(session_key.clone());
+        if let Some(replaced) = self
+            .pending_notification_relays
+            .lock()
+            .await
+            .insert(session_key.clone(), PendingNotificationRelaysForSession { relays: pending_relays, cleanup_handle })
+        {
+            replaced.cleanup_handle.abort();
+        }
+    }
+
+    fn spawn_pending_initialized_cleanup(&self, session_key: SessionKey) -> tokio::task::JoinHandle<()> {
+        let pending_notification_relays = Arc::clone(&self.pending_notification_relays);
+        let transports = Arc::clone(&self.transports);
+        let transport_session_keys = Arc::clone(&self.transport_session_keys);
+        let session_cleanup_registry = Arc::clone(&self.session_cleanup_registry);
+        let subscription_change_locks = Arc::clone(&self.subscription_change_locks);
+        let user_session_store = self.user_session_store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PENDING_INITIALIZED_RELAY_TIMEOUT).await;
+            {
+                let mut pending = pending_notification_relays.lock().await;
+                if pending.remove(&session_key).is_none() {
+                    return;
+                }
+            }
+            cleanup_pending_initialized_session(PendingInitializedCleanup {
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+                session_key: &session_key,
+            })
+            .await;
+        })
+    }
+
+    async fn start_pending_notification_relays(&self, session_key: &SessionKey) {
+        let pending = self.pending_notification_relays.lock().await.remove(session_key);
+        let Some(pending) = pending else {
+            return;
+        };
+        pending.cleanup_handle.abort();
+        for pending_relay in pending.relays {
+            self.spawn_notification_relay(
+                pending_relay.notification_rx,
+                pending_relay.backend_name,
+                session_key.clone(),
+                pending_relay.downstream_peer,
             )
             .await;
-
-        let mut transports = self.transports.lock().await;
-        for (name, svc) in backend_services {
-            transports
-                .entry(BackendTransportKey::from((name.as_str(), downstream_session_id.value())))
-                .insert_entry(svc);
         }
-        drop(transports);
-
-        Ok(InitializeResult::new(merge_capabilities(capabilities))
-            .with_server_info(Implementation::new("rust-conformance-server", "0.1.0"))
-            .with_instructions("Rust MCP conformance test server"))
     }
 
-    async fn ping(&self, _cx: RequestContext<RoleServer>) -> Result<(), ErrorData> {
-        Ok(())
-    }
-
-    async fn list_tools(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        let mcp_call_validator = AuthorizedCallValidator::new("list_tools", &cx);
-        let (virtual_host, session_id) = mcp_call_validator.validate()?;
-
-        let session_manager = SessionManager::new(virtual_host, session_id, &self.transports);
-        let backend_transports: Vec<_> = session_manager.borrow_transports().await;
-
-        let list_tools_tasks = backend_transports
-            .into_iter()
-            .map(|service_holder| {
-                let request = request.clone();
-                async move {
-                    if let Some(service) = service_holder.running_service {
-                        //let service = service.read().await;
-                        let response = service.list_tools(request).await;
-                        (service_holder.name, Some(response))
-                    } else {
-                        (service_holder.name, None)
-                    }
-                }
+    async fn resume_notification_relay(&self, resume: NotificationRelayResume<'_, '_>) {
+        let key = BackendTransportKey::from((resume.backend_name.as_str(), &resume.session_key));
+        if let Some(notification_rx) = resume.notification_rx {
+            self.drain_then_spawn_notification_relay(BufferedNotificationRelay {
+                notification_rx,
+                key,
+                backend_name: resume.backend_name,
+                session_key: resume.session_key,
+                downstream_peer: resume.downstream_peer,
             })
-            .collect::<Vec<_>>();
-
-        let list_tools_tasks_results: Vec<(String, Option<_>)> = futures::future::join_all(list_tools_tasks).await;
-
-        let responses: Vec<_> = list_tools_tasks_results
-            .into_iter()
-            .map(|(name, response)| {
-                info!("list_tools: backend {name} {response:?}");
-                (name, response)
-            })
-            .collect();
-
-        let responses = responses
-            .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
-            )
-            .collect::<Vec<_>>();
-
-        let merged_list_tools = merge_tools(responses);
-
-        Ok(ListToolsResult { meta: None, tools: merged_list_tools, next_cursor: None })
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let mcp_call_validator = AuthorizedCallValidator::new("call_tool", &cx);
-        let (virtual_host, session_id) = mcp_call_validator.validate()?;
-        let session_manager = SessionManager::new(virtual_host, session_id, &self.transports);
-
-        let backend_names = session_manager.get_backend_names();
-
-        let Some(BackendToolPair { backend_name, tool_name }) = split_tool_name(&request.name, &backend_names) else {
-            return Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... wrong tool name".into(),
-                data: None,
-            });
-        };
-        let backend_name = backend_name.to_owned();
-        let tool_name = tool_name.to_owned();
-        let request_name = request.name.clone();
-
-        let backend_transports = session_manager.borrow_transports().await;
-        info!("Borrowed transports {session_id:?} {backend_transports:?}");
-        let mut target_service = None;
-        for service_holder in backend_transports {
-            debug!(
-                "call_tool: Finding backend for {} {service_holder:?} {backend_name} tool_name = {tool_name}",
-                &request_name,
-            );
-            if service_holder.name == backend_name {
-                if target_service.is_some() {
-                    warn!("call_tool: More than one tool matching for tool name {}", request_name);
-                    session_manager.cleanup_backends("call_tool: invalid session.. duplicate tools detected").await;
-                    return Err(ErrorData {
-                        code: ErrorCode::INVALID_REQUEST,
-                        message: "Routing problem... multiple matching tools".into(),
-                        data: None,
-                    });
-                }
-                target_service = Some(service_holder);
-            }
-        }
-
-        let Some(mut target_service) = target_service else {
-            return Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... got no responses from backends".into(),
-                data: None,
-            });
-        };
-        let Some(service) = target_service.running_service.take() else {
-            warn!(
-                "call_tool: trying to call a tool for which we have no backend {target_service:?} {backend_name} tool_name = {tool_name}"
-            );
-            return Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... got no responses from backends".into(),
-                data: None,
-            });
-        };
-
-        let pre_result = if let Some(plugin_runtime) = &self.plugin_runtime {
-            plugin_runtime.before_tool_call(&request, &tool_name, &backend_name).await?
+            .await;
         } else {
-            ToolPreCallResult::unchanged()
-        };
-        let post_state = pre_result.state;
-        let mut routed_request = request;
-        pre_result.arguments.apply_to_request(&mut routed_request, &tool_name);
-
-        let service_name = target_service.name.clone();
-        let response = service.call_tool(routed_request).await;
-        let response = response.map_err(|error| {
-            warn!("call_tool: backend {service_name} {error:?}");
-            ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... got no responses from backends".into(),
-                data: None,
-            }
-        })?;
-        let response = match (&self.plugin_runtime, post_state) {
-            (Some(plugin_runtime), Some(post_state)) => {
-                plugin_runtime.after_tool_call(&tool_name, response, Some(post_state)).await?
-            },
-            _ => response,
-        };
-        info!("call_tool: backend {service_name} completed");
-        Ok(response)
-    }
-
-    async fn list_resources(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        let mcp_call_validator = AuthorizedCallValidator::new("list_resources", &cx);
-        let (virtual_host, session_id) = mcp_call_validator.validate()?;
-
-        let session_manager = SessionManager::new(virtual_host, session_id, &self.transports);
-        let backend_transports: Vec<_> = session_manager.borrow_transports().await;
-
-        let list_resources_tasks = backend_transports
-            .into_iter()
-            .map(|service_holder| {
-                let request = request.clone();
-                async move {
-                    if let Some(service) = service_holder.running_service {
-                        //let service = service.read().await;
-                        let response = service.list_resources(request).await;
-                        (service_holder.name, Some(response))
-                    } else {
-                        (service_holder.name, None)
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let list_tools_tasks_results: Vec<(String, Option<_>)> = futures::future::join_all(list_resources_tasks).await;
-
-        let responses: Vec<_> = list_tools_tasks_results
-            .into_iter()
-            .map(|(name, response)| {
-                info!("list_resources: backend {name} {response:?}");
-                (name, response)
-            })
-            .collect();
-
-        let responses = responses
-            .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
+            self.ensure_notification_relay(
+                resume.session_manager,
+                &resume.backend_name,
+                &resume.session_key,
+                resume.downstream_peer,
             )
-            .collect::<Vec<_>>();
-
-        let merged_list_resources = merge_resources(responses);
-
-        Ok(ListResourcesResult { meta: None, resources: merged_list_resources, next_cursor: None })
+            .await;
+        }
     }
 
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        let mcp_call_validator = AuthorizedCallValidator::new("read_resource", &cx);
-        let (virtual_host, session_id) = mcp_call_validator.validate()?;
-        let session_manager = SessionManager::new(virtual_host, session_id, &self.transports);
-
-        let backend_names = session_manager.get_backend_names();
-
-        let Some(BackendResourcePair { backend_name, resource_uri }) =
-            split_resource_name(&request.uri, &backend_names)
-        else {
-            return Err(ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: "Routing problem... wrong resource name".into(),
-                data: None,
-            });
+    async fn drain_then_spawn_notification_relay(&self, buffered_relay: BufferedNotificationRelay) {
+        let notification_rx = match drain_buffered_session_notifications(SessionNotificationRelay {
+            notification_rx: buffered_relay.notification_rx,
+            backend_name: buffered_relay.backend_name.clone(),
+            downstream_peer: buffered_relay.downstream_peer.clone(),
+            resource_subscriptions: Arc::clone(&self.subscriptions),
+            log_levels: Arc::clone(&self.log_levels),
+            progress_tokens: Arc::clone(&self.progress_tokens),
+            session_key: buffered_relay.session_key.clone(),
+        })
+        .await
+        {
+            Ok(notification_rx) => notification_rx,
+            Err(SessionRelayExit::DownstreamClosed) => {
+                self.cleanup_session_state(&buffered_relay.key.session_key).await;
+                return;
+            },
+            Err(SessionRelayExit::BackendClosed | SessionRelayExit::NotificationForwardFailed) => return,
         };
+        self.spawn_notification_relay_locked(
+            notification_rx,
+            buffered_relay.backend_name,
+            buffered_relay.session_key,
+            buffered_relay.downstream_peer,
+        )
+        .await;
+    }
+    async fn spawn_notification_relay(
+        &self,
+        notification_rx: broadcast::Receiver<BackendNotification>,
+        backend_name: String,
+        session_key: SessionKey,
+        downstream_peer: Peer<RoleServer>,
+    ) {
+        let key = BackendTransportKey::from((backend_name.as_str(), &session_key));
+        let change_lock = self.subscription_change_lock(&key).await;
+        let Ok(_change_guard) = change_lock.try_lock() else {
+            return;
+        };
+        self.spawn_notification_relay_locked(notification_rx, backend_name, session_key, downstream_peer).await;
+    }
 
-        let backend_transports = session_manager.borrow_transports().await;
-        info!("Borrowed transports {session_id:?} {backend_transports:?}");
-
-        let call_tool_tasks: Vec<_> = backend_transports
-            .into_iter()
-            .map(|service_holder| {
-                debug!(
-                    "read_resource: Finding backend for {} {service_holder:?} {backend_name} read_resource = {resource_uri}",
-                    &request.uri,
-
-                );
-                (service_holder.name == backend_name).then(|| {
-                    let mut request = request.clone();
-                    request.uri = String::from(resource_uri);
-                        async move {
-                            if let Some(service) = service_holder.running_service {
-                                //let service = service.read().await;
-                                let response = service.read_resource(request).await;
-
-                                (service_holder.name, Some(response))
-                            } else {
-                                warn!("call_tool: trying to call a tool for which we have no backend {service_holder:?} {backend_name} resource_name = {resource_uri}");
-                                (service_holder.name, None)
-                            }
-                        }
-                })
-            }).collect();
-
-        let call_tool_tasks = call_tool_tasks.into_iter().flatten().collect::<Vec<_>>();
-        if call_tool_tasks.len() > 1 {
-            warn!("read_resource: More than one tool matching for tool name {}", request.uri);
-
-            session_manager.cleanup_backends("read_resource: invalid session.. duplicate resources detected").await;
-
-            return Err(ErrorData {
-                code: ErrorCode::INVALID_REQUEST,
-                message: "Routing problem... multiple matching resources".into(),
-                data: None,
-            });
+    async fn spawn_notification_relay_locked(
+        &self,
+        notification_rx: broadcast::Receiver<BackendNotification>,
+        backend_name: String,
+        session_key: SessionKey,
+        downstream_peer: Peer<RoleServer>,
+    ) {
+        let key = BackendTransportKey::from((backend_name.as_str(), &session_key));
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let log_levels = Arc::clone(&self.log_levels);
+        let progress_tokens = Arc::clone(&self.progress_tokens);
+        let transports = Arc::clone(&self.transports);
+        let transport_session_keys = Arc::clone(&self.transport_session_keys);
+        let notification_relay_state = Arc::clone(&self.notification_relay_state);
+        let session_cleanup_registry = Arc::clone(&self.session_cleanup_registry);
+        let subscription_change_locks = Arc::clone(&self.subscription_change_locks);
+        let user_session_store = self.user_session_store.clone();
+        let generation = self.notification_relay_generation.fetch_add(1, Ordering::Relaxed);
+        let key_for_task = key.clone();
+        let mut state = self.notification_relay_state.lock().await;
+        if state.relays.get(&key).is_some_and(|relay| !relay.handle.is_finished()) {
+            return;
         }
-
-        let call_tool_tasks_results: Vec<_> = futures::future::join_all(call_tool_tasks).await;
-
-        let responses: Vec<_> = call_tool_tasks_results
-            .into_iter()
-            .map(|(name, response)| {
-                info!("read_resource: backend {name} {response:?}");
-                (name, response)
+        state.relays.remove(&key);
+        let handle = tokio::spawn(async move {
+            let relay_subscriptions = Arc::clone(&subscriptions);
+            let relay_log_levels = Arc::clone(&log_levels);
+            let relay_progress_tokens = Arc::clone(&progress_tokens);
+            let exit = relay_backend_notifications(SessionNotificationRelay {
+                notification_rx,
+                backend_name,
+                downstream_peer,
+                resource_subscriptions: relay_subscriptions,
+                log_levels: relay_log_levels,
+                progress_tokens: relay_progress_tokens,
+                session_key,
             })
-            .collect();
-
-        let responses = responses
-            .into_iter()
-            .filter_map(
-                |(name, response)| if let Some(Ok(response)) = response { Some((name, response)) } else { None },
+            .await;
+            cleanup_finished_notification_relay(
+                NotificationRelayCleanup {
+                    subscriptions: &subscriptions,
+                    log_levels: &log_levels,
+                    progress_tokens: &progress_tokens,
+                    transports: &transports,
+                    transport_session_keys: &transport_session_keys,
+                    notification_relay_state: &notification_relay_state,
+                    session_cleanup_registry: &session_cleanup_registry,
+                    subscription_change_locks: &subscription_change_locks,
+                    user_session_store: &user_session_store,
+                },
+                &key_for_task,
+                generation,
+                exit,
             )
-            .collect::<Vec<_>>();
-
-        responses.first().cloned().map(|(_, r)| r).ok_or(ErrorData {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: "Routing problem... got no responses from backends".into(),
-            data: None,
-        })
+            .await;
+        });
+        state.relays.insert(key, NotificationRelayHandle { generation, handle });
     }
 
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("list_resource_templates user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-        Ok(ListResourceTemplatesResult {
-            meta: None,
-            resource_templates: vec![
-                RawResourceTemplate {
-                    uri_template: "test://template/{id}/data".into(),
-                    name: "Dynamic Resource".into(),
-                    title: None,
-                    description: Some("A dynamic resource with parameter substitution".into()),
-                    mime_type: Some("application/json".into()),
-                    icons: None,
-                }
-                .no_annotation(),
-            ],
-            next_cursor: None,
-        })
+    async fn notification_relay_is_active(&self, key: &BackendTransportKey) -> bool {
+        let mut state = self.notification_relay_state.lock().await;
+        if state.relays.get(key).is_some_and(|relay| !relay.handle.is_finished()) {
+            return true;
+        }
+        state.relays.remove(key);
+        false
     }
 
-    async fn subscribe(
-        &self,
-        request: SubscribeRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("subscribe user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-
-        let mut subs = self.subscriptions.lock().await;
-        subs.insert(request.uri.clone());
-        Ok(())
+    async fn subscription_change_lock(&self, key: &BackendTransportKey) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.subscription_change_locks.lock().await.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
-    async fn unsubscribe(
-        &self,
-        request: UnsubscribeRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("unsubscribe user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-
-        let mut subs = self.subscriptions.lock().await;
-        subs.remove(request.uri.as_str());
-        Ok(())
+    async fn subscription_change_in_progress(&self, key: &BackendTransportKey) -> bool {
+        let locks = self.subscription_change_locks.lock().await;
+        locks.get(key).is_some_and(|lock| lock.try_lock().is_err())
     }
 
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("list_prompts user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-
-        Ok(ListPromptsResult {
-            meta: None,
-            prompts: vec![
-                Prompt::new("test_simple_prompt", Some("A simple test prompt with no arguments"), None),
-                Prompt::new(
-                    "test_prompt_with_arguments",
-                    Some("A test prompt that accepts arguments"),
-                    Some(vec![
-                        PromptArgument::new("name").with_description("The name to greet").with_required(true),
-                        PromptArgument::new("style").with_description("The greeting style").with_required(false),
-                    ]),
-                ),
-                Prompt::new(
-                    "test_prompt_with_embedded_resource",
-                    Some("A test prompt that includes an embedded resource"),
-                    None,
-                ),
-                Prompt::new("test_prompt_with_image", Some("A test prompt that includes an image"), None),
-            ],
-            next_cursor: None,
-        })
-    }
-
-    async fn get_prompt(
-        &self,
-        request: GetPromptRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("get_prompt user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-        match request.name.as_str() {
-            "test_simple_prompt" => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                PromptMessageRole::User,
-                "This is a simple test prompt.",
-            )])
-            .with_description("A simple test prompt")),
-            "test_prompt_with_arguments" => {
-                let args = request.arguments.unwrap_or_default();
-                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("World");
-                let style = args.get("style").and_then(|v| v.as_str()).unwrap_or("friendly");
-                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    format!("Please greet {name} in a {style} style."),
-                )])
-                .with_description("A prompt with arguments"))
-            },
-            "test_prompt_with_embedded_resource" => Ok(GetPromptResult::new(vec![
-                PromptMessage::new_text(PromptMessageRole::User, "Here is a resource:"),
-                PromptMessage::new_resource(
-                    PromptMessageRole::User,
-                    "test://static-text".into(),
-                    Some("text/plain".into()),
-                    Some("Resource content for prompt".into()),
-                    None,
-                    None,
-                    None,
-                ),
-            ])
-            .with_description("A prompt with an embedded resource")),
-            "test_prompt_with_image" => {
-                let image_content =
-                    RawImageContent { data: TEST_IMAGE_DATA.into(), mime_type: "image/png".into(), meta: None };
-                Ok(GetPromptResult::new(vec![
-                    PromptMessage::new_text(PromptMessageRole::User, "Here is an image:"),
-                    PromptMessage::new(
-                        PromptMessageRole::User,
-                        PromptMessageContent::Image { image: image_content.no_annotation() },
-                    ),
-                ])
-                .with_description("A prompt with an image"))
-            },
-            _ => Err(ErrorData::invalid_params(format!("Unknown prompt: {}", request.name), None)),
+    async fn stop_notification_relay(&self, backend_name: &str, session_key: &SessionKey) {
+        let key = BackendTransportKey::from((backend_name, session_key));
+        let relay = self.notification_relay_state.lock().await.relays.remove(&key);
+        if let Some(relay) = relay {
+            relay.handle.abort();
+            let _ = relay.handle.await;
         }
     }
 
-    async fn complete(
-        &self,
-        request: CompleteRequestParams,
-        cx: RequestContext<RoleServer>,
-    ) -> Result<CompleteResult, ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("complete user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-        let values = match &request.r#ref {
-            Reference::Resource(_) => {
-                if request.argument.name == "id" {
-                    vec!["1".into(), "2".into(), "3".into()]
-                } else {
-                    vec![]
-                }
-            },
-            Reference::Prompt(prompt_ref) => {
-                if request.argument.name == "name" {
-                    vec!["Alice".into(), "Bob".into(), "Charlie".into()]
-                } else if request.argument.name == "style" {
-                    vec!["friendly".into(), "formal".into(), "casual".into()]
-                } else {
-                    vec![prompt_ref.name.clone()]
-                }
-            },
-        };
-        Ok(CompleteResult::new(CompletionInfo::new(values).map_err(|e| ErrorData::internal_error(e, None))?))
+    async fn cleanup_notification_state(&self, session_key: &SessionKey) {
+        cleanup_notification_state(&self.subscriptions, &self.log_levels, &self.notification_relay_state, session_key)
+            .await;
+        self.progress_tokens.write().await.remove(session_key);
+        if let Some(pending) = self.pending_notification_relays.lock().await.remove(session_key) {
+            pending.cleanup_handle.abort();
+        }
+        self.subscription_change_locks.lock().await.retain(|key, _| &key.session_key != session_key);
     }
 
-    async fn set_level(&self, request: SetLevelRequestParams, cx: RequestContext<RoleServer>) -> Result<(), ErrorData> {
-        let maybe_parts = cx.extensions.get::<Parts>();
-        let maybe_session = maybe_parts.and_then(|parts| parts.extensions.get::<SessionId>());
-        let maybe_user_config = maybe_parts.and_then(|parts| parts.extensions.get::<UserConfig>());
-        info!("set_level user_config = {maybe_user_config:#?} session_id = {maybe_session:#?}");
-        let mut level = self.log_level.lock().await;
-        *level = request.level;
-        Ok(())
-    }
-}
-
-#[derive(Debug, PartialEq, PartialOrd, Ord, Eq)]
-struct BackendToolPair<'a> {
-    backend_name: &'a str,
-    tool_name: &'a str,
-}
-
-#[derive(Debug, PartialEq, PartialOrd, Ord, Eq)]
-struct BackendResourcePair<'a> {
-    backend_name: &'a str,
-    resource_uri: &'a str,
-}
-
-fn split_tool_name<'a, T: AsRef<str>, N: AsRef<str>>(
-    tool_name: &'a T,
-    backend_names: &'a [N],
-) -> Option<BackendToolPair<'a>> {
-    for name in backend_names {
-        let tool_name = tool_name.as_ref();
-        let name = name.as_ref();
-        let extended_name = name.to_owned() + "-";
-        if tool_name.starts_with(&extended_name) {
-            return Some(BackendToolPair { backend_name: name, tool_name: &tool_name[extended_name.len()..] });
+    async fn cleanup_transport_state(&self, session_key: &SessionKey) {
+        let keys = self.transport_session_keys.lock().await.remove(session_key).unwrap_or_default();
+        let mut transports = self.transports.lock().await;
+        for key in keys {
+            transports.remove(&key);
         }
     }
-    None
-}
 
-const TEST_IMAGE_DATA: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-// Small base64-encoded WAV (silence)
-
-fn merge_capabilities(_server_capabilities: Vec<(String, Option<ServerCapabilities>)>) -> ServerCapabilities {
-    ServerCapabilities::builder().enable_prompts().enable_resources().enable_tools().enable_logging().build()
-}
-
-fn merge_tools(tools: Vec<(String, ListToolsResult)>) -> Vec<Tool> {
-    tools
-        .into_iter()
-        .flat_map(|(backend_name, result)| {
-            result
-                .tools
-                .into_iter()
-                .map(|mut t| {
-                    t.name = format!("{backend_name}-{}", t.name).into();
-                    t
-                })
-                .collect::<Vec<_>>()
-        })
-        .sorted_by(|t, o| t.name.cmp(&o.name))
-        .collect::<Vec<_>>()
-}
-
-fn merge_resources(resources: Vec<(String, ListResourcesResult)>) -> Vec<Resource> {
-    resources
-        .into_iter()
-        .flat_map(|(backend_name, result)| {
-            result
-                .resources
-                .into_iter()
-                .map(|mut t| {
-                    t.name = format!("{backend_name}-{}", t.name);
-                    t.uri = format!("{backend_name}-{}", t.uri);
-                    t
-                })
-                .collect::<Vec<_>>()
-        })
-        .sorted_by(|t, o| t.name.cmp(&o.name))
-        .collect::<Vec<_>>()
-}
-
-fn split_resource_name<'a, T: AsRef<str>, N: AsRef<str>>(
-    resource_uri: &'a T,
-    backend_names: &'a [N],
-) -> Option<BackendResourcePair<'a>> {
-    for name in backend_names {
-        let resource_uri = resource_uri.as_ref();
-        let name = name.as_ref();
-        let extended_name = name.to_owned() + "-";
-        if resource_uri.starts_with(&extended_name) {
-            return Some(BackendResourcePair {
-                backend_name: name,
-                resource_uri: &resource_uri[extended_name.len()..],
-            });
-        }
+    async fn cleanup_session_state(&self, session_key: &SessionKey) {
+        self.session_cleanup_registry.lock().await.remove(&session_key.to_user_session());
+        self.cleanup_notification_state(session_key).await;
+        self.cleanup_transport_state(session_key).await;
+        let _ = self.user_session_store.remove_session(&session_key.to_user_session()).await;
     }
-    None
+
+    async fn register_session_cleanup(&self, session_key: &SessionKey) {
+        self.session_cleanup_registry.lock().await.insert(
+            session_key.to_user_session(),
+            SessionCleanupHandle {
+                session_key: session_key.clone(),
+                subscriptions: Arc::clone(&self.subscriptions),
+                log_levels: Arc::clone(&self.log_levels),
+                progress_tokens: Arc::clone(&self.progress_tokens),
+                transports: Arc::clone(&self.transports),
+                transport_session_keys: Arc::clone(&self.transport_session_keys),
+                notification_relay_state: Arc::clone(&self.notification_relay_state),
+                pending_notification_relays: Arc::clone(&self.pending_notification_relays),
+                subscription_change_locks: Arc::clone(&self.subscription_change_locks),
+                user_session_store: Arc::new(self.user_session_store.clone()),
+            },
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use rmcp::model::LoggingLevel;
+
+    use crate::gateway::session_store::SessionMapping;
+
+    use super::lifecycle::remove_progress_token;
+    use super::routing::{
+        BackendResourcePair, BackendToolPair, merge_capabilities, split_resource_name, split_tool_name,
+    };
     use super::*;
+
+    fn test_subscriptions(session_key: &SessionKey) -> ResourceSubscriptions {
+        Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([(
+                "backend".to_owned(),
+                std::collections::HashSet::from(["backend-memo://insights".to_owned()]),
+            )]),
+        )])))
+    }
+
+    fn test_transport_session_keys(
+        session_key: &SessionKey,
+        keys: impl IntoIterator<Item = BackendTransportKey>,
+    ) -> TransportSessionKeys {
+        Arc::new(Mutex::new(HashMap::from([(session_key.clone(), keys.into_iter().collect())])))
+    }
+
+    fn test_session_cleanup_registry() -> SessionCleanupRegistry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn test_splitting() {
@@ -779,5 +630,574 @@ mod tests {
         let tool_name = "counter_one-get-value";
         let pair = BackendToolPair { backend_name: "counter_one", tool_name: "get-value" };
         assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
+
+        let backend_names = vec!["counter", "counter-one"];
+        let tool_name = "counter-one-get-value";
+        let pair = BackendToolPair { backend_name: "counter-one", tool_name: "get-value" };
+        assert_eq!(Some(pair), split_tool_name(&tool_name, &backend_names));
+
+        let resource_uri = "counter-one-memo://insights";
+        let pair = BackendResourcePair { backend_name: "counter-one", resource_uri: "memo://insights" };
+        assert_eq!(Some(pair), split_resource_name(&resource_uri, &backend_names));
+
+        let resource_uri = "unknown-memo://insights";
+        assert_eq!(None, split_resource_name(&resource_uri, &backend_names));
+    }
+
+    #[test]
+    fn merge_capabilities_advertises_relayed_notifications() {
+        let backend_capabilities = ServerCapabilities::builder()
+            .enable_prompts()
+            .enable_prompts_list_changed()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_resources_list_changed()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build();
+        let capabilities = merge_capabilities(&[Some(backend_capabilities)]);
+
+        assert_eq!(capabilities.prompts.as_ref().and_then(|c| c.list_changed), None);
+        assert_eq!(capabilities.resources.as_ref().and_then(|c| c.subscribe), Some(true));
+        assert_eq!(capabilities.resources.as_ref().and_then(|c| c.list_changed), Some(true));
+        assert_eq!(capabilities.tools.as_ref().and_then(|c| c.list_changed), Some(true));
+    }
+
+    #[test]
+    fn merge_capabilities_omits_unsupported_backend_notifications() {
+        let capabilities = merge_capabilities(&[]);
+
+        assert_eq!(capabilities.prompts.as_ref().and_then(|c| c.list_changed), None);
+        assert_eq!(capabilities.resources.as_ref().and_then(|c| c.subscribe), None);
+        assert_eq!(capabilities.resources.as_ref().and_then(|c| c.list_changed), None);
+        assert_eq!(capabilities.tools.as_ref().and_then(|c| c.list_changed), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_notification_state_removes_session_entries() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let subscriptions = test_subscriptions(&session_key);
+        let log_levels = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend".to_owned(), LoggingLevel::Error)]),
+        )])));
+        let key = BackendTransportKey::from(("backend", &session_key));
+        let notification_relay_state = Arc::new(Mutex::new(NotificationRelayState {
+            relays: HashMap::from([(
+                key.clone(),
+                NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) },
+            )]),
+        }));
+
+        cleanup_notification_state(&subscriptions, &log_levels, &notification_relay_state, &session_key).await;
+
+        assert!(!subscriptions.read().await.contains_key(&session_key));
+        assert!(!log_levels.write().await.contains_key(&session_key));
+        assert!(!notification_relay_state.lock().await.relays.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_notification_relay_removes_handle_only() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let subscriptions = test_subscriptions(&session_key);
+        let log_levels = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend".to_owned(), LoggingLevel::Error)]),
+        )])));
+        let transports = Arc::new(Mutex::new(HashMap::new()));
+        let transport_session_keys = test_transport_session_keys(&session_key, [key.clone()]);
+        let notification_relay_state = Arc::new(Mutex::new(NotificationRelayState {
+            relays: HashMap::from([(
+                key.clone(),
+                NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) },
+            )]),
+        }));
+        let subscription_change_locks = Arc::new(Mutex::new(HashMap::new()));
+        let progress_tokens = Arc::new(RwLock::new(HashMap::new()));
+        let session_cleanup_registry = test_session_cleanup_registry();
+        let user_session_store = LocalUserSessionStore::new();
+
+        cleanup_finished_notification_relay(
+            NotificationRelayCleanup {
+                subscriptions: &subscriptions,
+                log_levels: &log_levels,
+                progress_tokens: &progress_tokens,
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                notification_relay_state: &notification_relay_state,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+            },
+            &key,
+            2,
+            SessionRelayExit::BackendClosed,
+        )
+        .await;
+        assert!(notification_relay_state.lock().await.relays.contains_key(&key));
+
+        cleanup_finished_notification_relay(
+            NotificationRelayCleanup {
+                subscriptions: &subscriptions,
+                log_levels: &log_levels,
+                progress_tokens: &progress_tokens,
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                notification_relay_state: &notification_relay_state,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+            },
+            &key,
+            1,
+            SessionRelayExit::BackendClosed,
+        )
+        .await;
+
+        assert!(!notification_relay_state.lock().await.relays.contains_key(&key));
+        assert!(subscriptions.read().await.contains_key(&session_key));
+        assert!(log_levels.write().await.contains_key(&session_key));
+    }
+
+    #[tokio::test]
+    async fn notification_forward_failure_does_not_cleanup_session_state() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let subscriptions = test_subscriptions(&session_key);
+        let log_levels = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend".to_owned(), LoggingLevel::Error)]),
+        )])));
+        let transport_session_keys = test_transport_session_keys(&session_key, [key.clone()]);
+        let transports = Arc::new(Mutex::new(HashMap::from([(
+            key.clone(),
+            BackendTransportService {
+                capabilities: None,
+                service: None,
+                backend_notifications: broadcast::channel(1).0,
+            },
+        )])));
+        let notification_relay_state = Arc::new(Mutex::new(NotificationRelayState {
+            relays: HashMap::from([(
+                key.clone(),
+                NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) },
+            )]),
+        }));
+        let subscription_change_locks = Arc::new(Mutex::new(HashMap::from([(key.clone(), Arc::new(Mutex::new(())))])));
+        let progress_tokens = Arc::new(RwLock::new(HashMap::new()));
+        let session_cleanup_registry = test_session_cleanup_registry();
+        let user_session_store = LocalUserSessionStore::new();
+
+        cleanup_finished_notification_relay(
+            NotificationRelayCleanup {
+                subscriptions: &subscriptions,
+                log_levels: &log_levels,
+                progress_tokens: &progress_tokens,
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                notification_relay_state: &notification_relay_state,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+            },
+            &key,
+            1,
+            SessionRelayExit::NotificationForwardFailed,
+        )
+        .await;
+
+        assert!(!notification_relay_state.lock().await.relays.contains_key(&key));
+        assert!(subscriptions.read().await.contains_key(&session_key));
+        assert!(log_levels.write().await.contains_key(&session_key));
+        assert!(transports.lock().await.contains_key(&key));
+        assert!(subscription_change_locks.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_initialized_session_removes_transport_and_owner_state() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let transports = Arc::new(Mutex::new(HashMap::from([(
+            key.clone(),
+            BackendTransportService {
+                capabilities: None,
+                service: None,
+                backend_notifications: broadcast::channel(1).0,
+            },
+        )])));
+        let transport_session_keys = test_transport_session_keys(&session_key, [key.clone()]);
+        let session_cleanup_registry = Arc::new(Mutex::new(HashMap::new()));
+        let subscription_change_locks = Arc::new(Mutex::new(HashMap::from([(key.clone(), Arc::new(Mutex::new(())))])));
+        let user_session_store = LocalUserSessionStore::new();
+        user_session_store
+            .set_session(&session_key.to_user_session(), &SessionMapping::new())
+            .await
+            .expect("session owner should store");
+
+        cleanup_pending_initialized_session(PendingInitializedCleanup {
+            transports: &transports,
+            transport_session_keys: &transport_session_keys,
+            session_cleanup_registry: &session_cleanup_registry,
+            subscription_change_locks: &subscription_change_locks,
+            user_session_store: &user_session_store,
+            session_key: &session_key,
+        })
+        .await;
+
+        assert!(!transports.lock().await.contains_key(&key));
+        assert!(!transport_session_keys.lock().await.contains_key(&session_key));
+        assert!(!subscription_change_locks.lock().await.contains_key(&key));
+        assert!(
+            !user_session_store.has_session(&session_key.to_user_session()).await.expect("owner check should work")
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_registered_session_removes_full_session_state() {
+        let user_session_store = LocalUserSessionStore::new();
+        let service: McpService<LocalUserSessionStore> = McpService::builder()
+            .with_user_session_store(user_session_store.clone())
+            .with_http_client(reqwest::Client::new())
+            .build();
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let user_session = session_key.to_user_session();
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let token = ProgressToken(rmcp::model::NumberOrString::String("downstream".into()));
+
+        user_session_store
+            .set_session(&user_session, &SessionMapping::new())
+            .await
+            .expect("session owner should store");
+        service.subscriptions.write().await.insert(
+            session_key.clone(),
+            HashMap::from([("backend-a".to_owned(), HashSet::from(["backend-a-test://resource".to_owned()]))]),
+        );
+        service
+            .log_levels
+            .write()
+            .await
+            .insert(session_key.clone(), HashMap::from([("backend-a".to_owned(), LoggingLevel::Info)]));
+        service
+            .progress_tokens
+            .write()
+            .await
+            .insert(session_key.clone(), HashMap::from([("backend-a".to_owned(), HashSet::from([token]))]));
+        service.transports.lock().await.insert(
+            key.clone(),
+            BackendTransportService {
+                capabilities: None,
+                service: None,
+                backend_notifications: broadcast::channel(1).0,
+            },
+        );
+        service.transport_session_keys.lock().await.insert(session_key.clone(), HashSet::from([key.clone()]));
+        service
+            .notification_relay_state
+            .lock()
+            .await
+            .relays
+            .insert(key.clone(), NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) });
+        let cleanup_handle = tokio::spawn(async {});
+        service
+            .pending_notification_relays
+            .lock()
+            .await
+            .insert(session_key.clone(), PendingNotificationRelaysForSession { relays: Vec::new(), cleanup_handle });
+        service.subscription_change_locks.lock().await.insert(key.clone(), Arc::new(Mutex::new(())));
+        service.register_session_cleanup(&session_key).await;
+
+        assert!(lifecycle::cleanup_registered_session(&service.session_cleanup_registry, &user_session).await);
+
+        assert!(!service.session_cleanup_registry.lock().await.contains_key(&user_session));
+        assert!(!service.subscriptions.read().await.contains_key(&session_key));
+        assert!(!service.log_levels.write().await.contains_key(&session_key));
+        assert!(!service.progress_tokens.write().await.contains_key(&session_key));
+        assert!(!service.transports.lock().await.contains_key(&key));
+        assert!(!service.transport_session_keys.lock().await.contains_key(&session_key));
+        assert!(!service.notification_relay_state.lock().await.relays.contains_key(&key));
+        assert!(!service.pending_notification_relays.lock().await.contains_key(&session_key));
+        assert!(!service.subscription_change_locks.lock().await.contains_key(&key));
+        assert!(!user_session_store.has_session(&user_session).await.expect("owner check should work"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_notification_relay_removes_session_state_when_downstream_closes() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let other_key = BackendTransportKey::from(("backend-b", &session_key));
+        let failed_init_key = BackendTransportKey::from(("backend-c", &session_key));
+        let subscriptions = test_subscriptions(&session_key);
+        let log_levels = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend".to_owned(), LoggingLevel::Error)]),
+        )])));
+        let transport_session_keys =
+            test_transport_session_keys(&session_key, [key.clone(), other_key.clone(), failed_init_key.clone()]);
+        let transports = Arc::new(Mutex::new(HashMap::from([
+            (
+                key.clone(),
+                BackendTransportService {
+                    capabilities: None,
+                    service: None,
+                    backend_notifications: broadcast::channel(1).0,
+                },
+            ),
+            (
+                other_key.clone(),
+                BackendTransportService {
+                    capabilities: None,
+                    service: None,
+                    backend_notifications: broadcast::channel(1).0,
+                },
+            ),
+            (
+                failed_init_key.clone(),
+                BackendTransportService {
+                    capabilities: None,
+                    service: None,
+                    backend_notifications: broadcast::channel(1).0,
+                },
+            ),
+        ])));
+        let notification_relay_state = Arc::new(Mutex::new(NotificationRelayState {
+            relays: HashMap::from([
+                (key.clone(), NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) }),
+                (other_key.clone(), NotificationRelayHandle { generation: 1, handle: tokio::spawn(async {}) }),
+            ]),
+        }));
+        let subscription_change_locks = Arc::new(Mutex::new(HashMap::from([(key.clone(), Arc::new(Mutex::new(())))])));
+        let progress_tokens = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend-a".to_owned(), HashSet::new())]),
+        )])));
+        let session_cleanup_registry = test_session_cleanup_registry();
+        let user_session_store = LocalUserSessionStore::new();
+        user_session_store
+            .set_session(&session_key.to_user_session(), &SessionMapping::new())
+            .await
+            .expect("session owner should store");
+
+        cleanup_finished_notification_relay(
+            NotificationRelayCleanup {
+                subscriptions: &subscriptions,
+                log_levels: &log_levels,
+                progress_tokens: &progress_tokens,
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                notification_relay_state: &notification_relay_state,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+            },
+            &key,
+            1,
+            SessionRelayExit::DownstreamClosed,
+        )
+        .await;
+
+        {
+            let notification_relay_state = notification_relay_state.lock().await;
+            assert!(!notification_relay_state.relays.contains_key(&key));
+            assert!(!notification_relay_state.relays.contains_key(&other_key));
+        }
+        assert!(!subscriptions.read().await.contains_key(&session_key));
+        assert!(!log_levels.write().await.contains_key(&session_key));
+        assert!(!progress_tokens.write().await.contains_key(&session_key));
+        assert!(!transports.lock().await.contains_key(&key));
+        assert!(!transports.lock().await.contains_key(&other_key));
+        assert!(!transports.lock().await.contains_key(&failed_init_key));
+        assert!(!subscription_change_locks.lock().await.contains_key(&key));
+        assert!(
+            !user_session_store.has_session(&session_key.to_user_session()).await.expect("owner check should work")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_downstream_close_does_not_remove_newer_relay_state() {
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let subscriptions = test_subscriptions(&session_key);
+        let log_levels = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend".to_owned(), LoggingLevel::Error)]),
+        )])));
+        let transport_session_keys = test_transport_session_keys(&session_key, [key.clone()]);
+        let transports = Arc::new(Mutex::new(HashMap::from([(
+            key.clone(),
+            BackendTransportService {
+                capabilities: None,
+                service: None,
+                backend_notifications: broadcast::channel(1).0,
+            },
+        )])));
+        let notification_relay_state = Arc::new(Mutex::new(NotificationRelayState {
+            relays: HashMap::from([(
+                key.clone(),
+                NotificationRelayHandle { generation: 2, handle: tokio::spawn(async {}) },
+            )]),
+        }));
+        let subscription_change_locks = Arc::new(Mutex::new(HashMap::from([(key.clone(), Arc::new(Mutex::new(())))])));
+        let progress_tokens = Arc::new(RwLock::new(HashMap::from([(
+            session_key.clone(),
+            HashMap::from([("backend-a".to_owned(), HashSet::new())]),
+        )])));
+        let session_cleanup_registry = test_session_cleanup_registry();
+        let user_session_store = LocalUserSessionStore::new();
+        user_session_store
+            .set_session(&session_key.to_user_session(), &SessionMapping::new())
+            .await
+            .expect("session owner should store");
+
+        cleanup_finished_notification_relay(
+            NotificationRelayCleanup {
+                subscriptions: &subscriptions,
+                log_levels: &log_levels,
+                progress_tokens: &progress_tokens,
+                transports: &transports,
+                transport_session_keys: &transport_session_keys,
+                notification_relay_state: &notification_relay_state,
+                session_cleanup_registry: &session_cleanup_registry,
+                subscription_change_locks: &subscription_change_locks,
+                user_session_store: &user_session_store,
+            },
+            &key,
+            1,
+            SessionRelayExit::DownstreamClosed,
+        )
+        .await;
+
+        assert!(notification_relay_state.lock().await.relays.contains_key(&key));
+        assert!(subscriptions.read().await.contains_key(&session_key));
+        assert!(log_levels.write().await.contains_key(&session_key));
+        assert!(progress_tokens.write().await.contains_key(&session_key));
+        assert!(transports.lock().await.contains_key(&key));
+        assert!(subscription_change_locks.lock().await.contains_key(&key));
+        assert!(user_session_store.has_session(&session_key.to_user_session()).await.expect("owner check should work"));
+    }
+
+    #[tokio::test]
+    async fn subscription_change_lock_blocks_only_while_guard_is_held() {
+        let service: McpService<LocalUserSessionStore> = McpService::builder()
+            .with_user_session_store(LocalUserSessionStore::new())
+            .with_http_client(reqwest::Client::new())
+            .build();
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        let lock = service.subscription_change_lock(&key).await;
+
+        let guard = lock.lock().await;
+        assert!(service.subscription_change_in_progress(&key).await);
+
+        drop(guard);
+        assert!(!service.subscription_change_in_progress(&key).await);
+
+        service.cleanup_notification_state(&session_key).await;
+        assert!(!service.subscription_change_locks.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn progress_token_is_removed_after_response() {
+        let service: McpService<LocalUserSessionStore> = McpService::builder()
+            .with_user_session_store(LocalUserSessionStore::new())
+            .with_http_client(reqwest::Client::new())
+            .build();
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let token = ProgressToken(rmcp::model::NumberOrString::String("downstream".into()));
+
+        service.track_progress_token(&session_key, "backend-a", token.clone()).await;
+        assert!(service.progress_tokens.write().await.contains_key(&session_key));
+        remove_progress_token(&service.progress_tokens, &session_key, "backend-a", &token).await;
+        assert!(!service.progress_tokens.write().await.contains_key(&session_key));
+    }
+
+    #[tokio::test]
+    async fn pending_initialized_cleanup_task_removes_stale_session_state() {
+        let user_session_store = LocalUserSessionStore::new();
+        let service: McpService<LocalUserSessionStore> = McpService::builder()
+            .with_user_session_store(user_session_store.clone())
+            .with_http_client(reqwest::Client::new())
+            .build();
+        let session_key = SessionKey::new("subject", "virtual-host", "session-a");
+        let key = BackendTransportKey::from(("backend-a", &session_key));
+        service.transports.lock().await.insert(
+            key.clone(),
+            BackendTransportService {
+                capabilities: None,
+                service: None,
+                backend_notifications: broadcast::channel(1).0,
+            },
+        );
+        service.transport_session_keys.lock().await.insert(session_key.clone(), HashSet::from([key.clone()]));
+        service.subscription_change_locks.lock().await.insert(key.clone(), Arc::new(Mutex::new(())));
+        user_session_store
+            .set_session(&session_key.to_user_session(), &SessionMapping::new())
+            .await
+            .expect("session owner should store");
+
+        let cleanup_handle = service.spawn_pending_initialized_cleanup(session_key.clone());
+        service
+            .pending_notification_relays
+            .lock()
+            .await
+            .insert(session_key.clone(), PendingNotificationRelaysForSession { relays: Vec::new(), cleanup_handle });
+
+        wait_until(|| async { !service.pending_notification_relays.lock().await.contains_key(&session_key) }).await;
+
+        assert!(!service.pending_notification_relays.lock().await.contains_key(&session_key));
+        assert!(!service.transports.lock().await.contains_key(&key));
+        assert!(!service.transport_session_keys.lock().await.contains_key(&session_key));
+        assert!(!service.subscription_change_locks.lock().await.contains_key(&key));
+        assert!(
+            !user_session_store.has_session(&session_key.to_user_session()).await.expect("owner check should work")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_manager_scopes_transports_by_full_session_key() {
+        let backend_name = "backend".to_owned();
+        let virtual_host = contextforge_gateway_rs_apis::user_store::VirtualHost {
+            backends: HashMap::from([(
+                backend_name.clone(),
+                contextforge_gateway_rs_apis::user_store::BackendMCPGateway {
+                    url: "http://127.0.0.1:1".parse().expect("test URL should parse"),
+                },
+            )]),
+        };
+        let session_key = SessionKey::new("subject", "virtual-host", "session");
+        let other_subject = SessionKey::new("other-subject", "virtual-host", "session");
+        let other_virtual_host = SessionKey::new("subject", "other-virtual-host", "session");
+        let (backend_notifications, _) = broadcast::channel(1);
+        let transports = Arc::new(Mutex::new(HashMap::from([(
+            BackendTransportKey::from((backend_name.as_str(), &session_key)),
+            BackendTransportService { capabilities: None, service: None, backend_notifications },
+        )])));
+
+        let session_manager = SessionManager::new(&virtual_host, &session_key, &transports);
+        assert_eq!(session_manager.borrow_transports().await.len(), 1);
+        assert!(session_manager.borrow_transport("backend").await.is_some());
+
+        let session_manager = SessionManager::new(&virtual_host, &other_subject, &transports);
+        assert!(session_manager.borrow_transports().await.is_empty());
+        assert!(session_manager.borrow_transport("backend").await.is_none());
+
+        let session_manager = SessionManager::new(&virtual_host, &other_virtual_host, &transports);
+        assert!(session_manager.borrow_transports().await.is_empty());
+        assert!(session_manager.borrow_transport("backend").await.is_none());
+    }
+
+    async fn wait_until<F, Fut>(mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if condition().await {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "condition did not become true before timeout");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
